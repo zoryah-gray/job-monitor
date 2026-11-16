@@ -69,7 +69,8 @@ COMPANIES = [
     {"name": "Bechtel",
      "url":  "https://www.bechtel.com/careers/jobs/?q=software+engineer"},
     {"name": "Brunswick",
-     "url":  "https://careers.brunswick.com/us/en/search-results?keywords=software+engineer"},
+     "url":  "https://careers.brunswick.com/us/en/search-results?keywords=software+engineer",
+     "timeout_ms": 35000},
     {"name": "Capital One",
      "url":  "https://www.capitalonecareers.com/search-jobs?keywords=software+engineer&country=United%20States"},
     {"name": "Caterpillar (CAT)",
@@ -83,13 +84,13 @@ COMPANIES = [
     {"name": "General Dynamics",
      "url":  "https://www.gd.com/careers?keyword=software+engineer"},
     {"name": "Honeywell",
-     "url":  "https://careers.honeywell.com/us/en/search-results?keywords=software+engineer"},
+     "url":  "https://careers.honeywell.com/us/en/search-results?keywords=software+engineer&country=United%20States"},
     {"name": "IBM",
      "url":  "https://www.ibm.com/careers/search?field_keyword_08[0]=Software%20Engineer&field_keyword_18[0]=United%20States"},
     {"name": "Intel",
      "url":  "https://jobs.intel.com/en/search-jobs/software%20engineer/United%20States/599/1/2/6252001/39/-98/0/50"},
     {"name": "Medtronic",
-     "url":  "https://jobs.medtronic.com/jobs/search?keywords=software+engineer&country=United+States"},
+     "url":  "https://medtronic.wd1.myworkdayjobs.com/en-US/MedtronicCareers?q=software+engineer"},
     {"name": "Microsoft",
      "url":  "https://careers.microsoft.com/us/en/search-results?keywords=software+engineer&exp=Students+and+graduates"},
     {"name": "P&G",
@@ -100,6 +101,16 @@ COMPANIES = [
      "url":  "https://careers.united.com/us/en/search-results?keywords=software+engineer"},
     {"name": "UPS",
      "url":  "https://www.jobs-ups.com/search-jobs?keywords=software+engineer"},
+    {"name": "Amazon Web Services (AWS)",
+     "url":  "https://www.amazon.jobs/en/search?base_query=software+engineer&loc_query=United+States&business_category[]=amazon-web-services&job_type=Full-Time"},
+    {"name": "American Express (AMEX)",
+     "url":  "https://aexp.eightfold.ai/careers?query=software+engineer&location=United+States"},
+    {"name": "Coca-Cola",
+     "url":  "https://careers.coca-colacompany.com/en/jobs?search=software+engineer&location=United+States"},
+    {"name": "Deloitte",
+     "url":  "https://jobs2.deloitte.com/us/en/search-results?keywords=software%20engineer&country=United%20States"},
+    {"name": "Zoom",
+     "url":  "https://careers.zoom.us/jobs/search?search=software+engineer"},
 ]
 
 # ── Job boards ───────────────────────────────────────────────────────────────────
@@ -260,7 +271,7 @@ class Browser:
 
     async def __aenter__(self):
         if HAS_PLAYWRIGHT:
-            self._pw = await async_playwright().__aenter__()
+            self._pw = await async_playwright().start()
             self._browser = await self._pw.chromium.launch(
                 headless=True,
                 args=[
@@ -285,7 +296,7 @@ class Browser:
         if self._browser:
             await self._browser.close()
         if self._pw:
-            await self._pw.__aexit__(*args)
+            await self._pw.stop()
 
     async def fetch(self, url: str, timeout_ms: int = 20_000) -> tuple[str | None, str | None]:
         """Returns (html, error_or_None)."""
@@ -485,7 +496,8 @@ async def crawl_source(browser: Browser, source: dict, state: dict, max_jobs: in
     }
 
     # 1. Fetch the search / listing page
-    html, err = await browser.fetch(url)
+    fetch_timeout = source.get("timeout_ms", 20_000)
+    html, err = await browser.fetch(url, timeout_ms=fetch_timeout)
     if html is None:
         result["error"] = err
         print(f"⚠️  {err}")

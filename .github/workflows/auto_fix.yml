@@ -1,0 +1,89 @@
+name: Auto Fix
+
+on:
+  workflow_run:
+    workflows: ["Job Monitor"]
+    types: [completed]
+
+# Needs write access to commit the fix back
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    if: ${{ github.event.workflow_run.conclusion == 'failure' }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Get error logs from failed run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh run view ${{ github.event.workflow_run.id }} --log-failed > error_log.txt 2>&1 || true
+          echo "=== Last 60 lines of error log ==="
+          tail -60 error_log.txt
+
+      - name: Run auto-fix
+        id: autofix
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          SENDGRID_API_KEY:  ${{ secrets.SENDGRID_API_KEY }}
+          NOTIFY_EMAIL:      ${{ secrets.NOTIFY_EMAIL }}
+          FAILED_RUN_URL:    ${{ github.event.workflow_run.html_url }}
+          FAILED_RUN_NUMBER: ${{ github.event.workflow_run.run_number }}
+        run: python3 auto_fix_runner.py
+
+      - name: Commit and push fix
+        if: steps.autofix.outputs.fix_applied == 'true'
+        run: |
+          git config user.email "auto-fix[bot]@users.noreply.github.com"
+          git config user.name "auto-fix[bot]"
+          git add job_monitor.py
+          git commit -m "auto-fix: repair after failed run #${{ github.event.workflow_run.run_number }}"
+          git push
+
+      - name: Send success notification
+        if: steps.autofix.outputs.fix_applied == 'true'
+        env:
+          SENDGRID_API_KEY:  ${{ secrets.SENDGRID_API_KEY }}
+          NOTIFY_EMAIL:      ${{ secrets.NOTIFY_EMAIL }}
+          FAILED_RUN_URL:    ${{ github.event.workflow_run.html_url }}
+          FAILED_RUN_NUMBER: ${{ github.event.workflow_run.run_number }}
+        run: |
+          python3 -c "
+          import os, json, ssl
+          from urllib.request import Request, urlopen
+          key     = os.environ['SENDGRID_API_KEY']
+          to      = os.environ['NOTIFY_EMAIL']
+          run_url = os.environ['FAILED_RUN_URL']
+          run_num = os.environ['FAILED_RUN_NUMBER']
+          body = (
+              f'Job monitor run #{run_num} failed, but a bug fix was automatically generated '
+              f'by Claude and committed to the repo. The monitor will resume on its next '
+              f'scheduled run.\n\n'
+              f'Failed run: {run_url}\n\n'
+              f'No action needed unless the auto-fix run also fails.'
+          )
+          payload = json.dumps({
+              'personalizations': [{'to': [{'email': to}]}],
+              'from': {'email': 'jobmonitor@jobnotify.dev', 'name': 'Job Monitor'},
+              'subject': f'[Job Monitor] Bug auto-fixed (run #{run_num})',
+              'content': [{'type': 'text/plain', 'value': body}],
+          }).encode()
+          req = Request(
+              'https://api.sendgrid.com/v3/mail/send',
+              data=payload,
+              headers={'Authorization': f'Bearer {key}', 'Content-Type': 'application/json'},
+              method='POST',
+          )
+          with urlopen(req, timeout=30, context=ssl.create_default_context()) as r:
+              print(f'Notification sent ({r.status})')
+          "

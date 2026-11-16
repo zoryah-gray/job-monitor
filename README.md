@@ -12,18 +12,23 @@ Both jobs persist page-hash state across runs via Actions cache, so the hourly c
 
 ---
 
-## Tracked Companies (22)
+## Tracked Companies (27)
 
 | Company | Role Focus |
 |---|---|
 | ⚡ **Accenture** | AI Native Software Engineer (priority watch) |
 | Adobe | Software Engineer |
 | Amazon | Software Engineer — Full Time |
+| Amazon Web Services (AWS) | Software Engineer — Full Time |
+| American Express (AMEX) | Software Engineer |
+| Apple | All US roles |
 | Bank of America | Software Engineer |
 | Bechtel | Software Engineer |
 | Brunswick | Software Engineer |
 | Capital One | Software Engineer |
 | Caterpillar (CAT) | Software Engineer |
+| Coca-Cola | Software Engineer |
+| Deloitte | Software Engineer |
 | EcoLab | Software Engineer |
 | Epic Systems | All open roles |
 | GE Healthcare | Software Engineer |
@@ -31,13 +36,13 @@ Both jobs persist page-hash state across runs via Actions cache, so the hourly c
 | Honeywell | Software Engineer |
 | IBM | Software Engineer |
 | Intel | Software Engineer |
-| Apple | All US roles |
 | Medtronic | Software Engineer |
 | Microsoft | Software Engineer — Students & Graduates |
 | P&G | Software Engineer |
 | Polaris | Information Technology roles |
 | United Airlines | Software Engineer |
 | UPS | Software Engineer |
+| Zoom | Software Engineer |
 
 ---
 
@@ -68,6 +73,7 @@ Credentials are stored as encrypted Actions secrets (never in code):
 |---|---|
 | `NOTIFY_EMAIL` | Recipient address for all alerts |
 | `SENDGRID_API_KEY` | SendGrid API key for outbound email |
+| `ANTHROPIC_API_KEY` | Claude API key used by the auto-fix workflow |
 
 SendGrid trial expires **January 15, 2027**. The script will warn 30 days out. To switch to Gmail after expiry, add `SMTP_USER` and `SMTP_PASS` secrets and remove `SENDGRID_API_KEY`.
 
