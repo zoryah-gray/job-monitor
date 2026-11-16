@@ -1,0 +1,66 @@
+name: Job Monitor
+
+on:
+  schedule:
+    - cron: '0 18 * * *'   # Daily 12pm CST digest (UTC-6 → 18:00 UTC)
+    - cron: '0 * * * *'    # Hourly change detection (silent unless new postings found)
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Run mode'
+        required: false
+        default: 'scheduled'
+        type: choice
+        options:
+          - scheduled
+          - hourly
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # Restore persisted page-hash state so hourly change detection works across runs
+      - name: Restore state cache
+        uses: actions/cache/restore@v4
+        with:
+          path: job_monitor_state.json
+          key: job-monitor-state-${{ github.run_id }}
+          restore-keys: |
+            job-monitor-state-
+
+      - name: Install dependencies
+        run: |
+          pip install playwright beautifulsoup4
+          playwright install chromium --with-deps
+
+      - name: Run job monitor
+        env:
+          NOTIFY_EMAIL: ${{ secrets.NOTIFY_EMAIL }}
+          SENDGRID_API_KEY: ${{ secrets.SENDGRID_API_KEY }}
+        run: |
+          SCHEDULE="${{ github.event.schedule }}"
+          DISPATCH_MODE="${{ github.event.inputs.mode }}"
+          if [ "$SCHEDULE" = "0 18 * * *" ] || [ "$DISPATCH_MODE" = "scheduled" ]; then
+            echo "Mode: --scheduled (daily digest)"
+            python3 job_monitor.py --scheduled
+          else
+            echo "Mode: --hourly (change detection)"
+            python3 job_monitor.py --hourly
+          fi
+
+      # Always save updated state so next run has fresh page hashes
+      - name: Save state cache
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: job_monitor_state.json
+          key: job-monitor-state-${{ github.run_id }}
