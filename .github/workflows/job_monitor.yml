@@ -45,7 +45,8 @@ jobs:
       - name: Run job monitor
         env:
           NOTIFY_EMAIL: ${{ secrets.NOTIFY_EMAIL }}
-          SENDGRID_API_KEY: ${{ secrets.SENDGRID_API_KEY }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
         run: |
           SCHEDULE="${{ github.event.schedule }}"
           DISPATCH_MODE="${{ github.event.inputs.mode }}"
