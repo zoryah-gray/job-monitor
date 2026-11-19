@@ -53,6 +53,93 @@ MAX_JOBS_HOURLY = 10   # max new JD pages to deep-crawl per source, hourly run
 MAX_STATE_URLS  = 2000 # cap on seen_job_urls entries in state
 SENDGRID_EXPIRY = datetime(2027, 1, 15, tzinfo=CST)
 
+# ── Priority / flagged companies ─────────────────────────────────────────────────
+# Jobs from these companies are sorted to the top of email results.
+# Add any company name exactly as it appears in COMPANIES to prioritise it.
+FLAGGED_COMPANIES = frozenset([
+    "Accenture",
+    # "Microsoft",
+    # "Google",
+])
+
+# ── Industry map ─────────────────────────────────────────────────────────────────
+# (industry label, is_non_tech) — used for the digest insights panel.
+COMPANY_INDUSTRIES: dict[str, tuple[str, bool]] = {
+    "Accenture":                    ("Consulting / Tech Services",        False),
+    "Adobe":                        ("Creative Software / Tech",          False),
+    "Amazon":                       ("E-commerce / Cloud",                False),
+    "Amazon Web Services (AWS)":    ("Cloud / Infrastructure",            False),
+    "American Express (AMEX)":      ("Finance / Payments",                True),
+    "Apple":                        ("Consumer Electronics / Tech",        False),
+    "Bank of America":              ("Finance / Banking",                  True),
+    "Bechtel":                      ("Engineering / Construction",         True),
+    "Brunswick":                    ("Marine / Recreation / Mfg",          True),
+    "Capital One":                  ("Finance / Banking / Fintech",        True),
+    "Caterpillar (CAT)":            ("Heavy Equipment / Manufacturing",    True),
+    "Coca-Cola":                    ("Food & Beverage / Consumer Goods",   True),
+    "Deloitte":                     ("Consulting / Professional Services", True),
+    "EcoLab":                       ("Industrial / Water Treatment",       True),
+    "Epic Systems":                 ("Healthcare IT",                      True),
+    "GE Healthcare":                ("Healthcare / Medical Devices",       True),
+    "General Dynamics":             ("Defense / Aerospace",                True),
+    "Honeywell":                    ("Aerospace / Industrial Automation",  True),
+    "IBM":                          ("Tech / Consulting",                  False),
+    "Intel":                        ("Semiconductors / Hardware",          False),
+    "Medtronic":                    ("Medical Devices / Healthcare",       True),
+    "Microsoft":                    ("Tech / Cloud / AI",                  False),
+    "P&G":                          ("Consumer Goods / FMCG",              True),
+    "Polaris":                      ("Powersports / Recreation / Mfg",    True),
+    "United Airlines":              ("Aviation / Transportation",           True),
+    "UPS":                          ("Logistics / Supply Chain",            True),
+    "Zoom":                         ("Tech / Communications",               False),
+}
+
+# Non-tech industry blurbs shown in the 12pm digest insights panel.
+NON_TECH_INDUSTRY_NOTES: list[tuple[str, str, list[str]]] = [
+    (
+        "Finance & Banking",
+        "Huge tech investment in digital banking, fraud detection, and payment systems. "
+        "Competitive comp and strong job stability — often overlooked by new grads.",
+        ["Bank of America", "Capital One", "American Express (AMEX)"],
+    ),
+    (
+        "Healthcare & Medical Devices",
+        "Mission-driven work building diagnostic tools, patient records, and surgical robotics. "
+        "Epic Systems hires heavily for new grads with no prior experience required.",
+        ["Medtronic", "GE Healthcare", "Epic Systems"],
+    ),
+    (
+        "Defense & Aerospace",
+        "Embedded systems, navigation software, and AI/ML for defense. "
+        "US citizenship often satisfies security clearance pre-screening.",
+        ["General Dynamics", "Honeywell"],
+    ),
+    (
+        "Consumer Goods & Manufacturing",
+        "Digital transformation is driving SWE demand outside Silicon Valley — "
+        "usually lower competition than Big Tech with strong benefits.",
+        ["P&G", "Caterpillar (CAT)", "Coca-Cola", "Brunswick", "Polaris"],
+    ),
+    (
+        "Logistics & Transportation",
+        "Real-time tracking, route optimization, and digital ops at massive scale. "
+        "Engineering orgs often overlooked by new grads — worth checking.",
+        ["UPS", "United Airlines"],
+    ),
+    (
+        "Consulting / Professional Services",
+        "Firms like Accenture and Deloitte deploy SWEs across industries. "
+        "Great for breadth of experience and exposure early-career.",
+        ["Accenture", "Deloitte"],
+    ),
+    (
+        "Engineering Services & Industrial",
+        "IoT, process automation, water-treatment systems, and large-scale infrastructure. "
+        "Growing demand for SWEs who can bridge hardware and software.",
+        ["Bechtel", "EcoLab"],
+    ),
+]
+
 # ── Company career sites ─────────────────────────────────────────────────────────
 COMPANIES = [
     {"name": "Accenture",
@@ -552,6 +639,7 @@ async def crawl_source(browser: Browser, source: dict, state: dict, max_jobs: in
                 "title":  f"[Job link from {name}]",
                 "url":    jd_url,
                 "reason": f"Could not fetch: {jd_err}",
+                "time":   now,
             })
             rev += 1
         else:
@@ -567,10 +655,10 @@ async def crawl_source(browser: Browser, source: dict, state: dict, max_jobs: in
                 "reason":     reason,
             }
             if verdict == "qualify":
-                result["jobs_qualify"].append({"title": title, "url": jd_url, "reason": reason})
+                result["jobs_qualify"].append({"title": title, "url": jd_url, "reason": reason, "time": now})
                 qual += 1
             elif verdict == "review":
-                result["jobs_review"].append({"title": title, "url": jd_url, "reason": reason})
+                result["jobs_review"].append({"title": title, "url": jd_url, "reason": reason, "time": now})
                 rev += 1
             else:
                 result["jobs_disqualify_count"] += 1
@@ -583,7 +671,17 @@ async def crawl_source(browser: Browser, source: dict, state: dict, max_jobs: in
     return result
 
 
-# ── Email ────────────────────────────────────────────────────────────────────────
+# ── Email helpers ────────────────────────────────────────────────────────────────
+
+def _fmt_time(iso_str: str) -> str:
+    """Format an ISO timestamp as 12-hour time, e.g. '2:28 PM'."""
+    try:
+        dt = datetime.fromisoformat(iso_str)
+        return dt.strftime("%-I:%M %p")
+    except Exception:
+        return ""
+
+
 def _sendgrid_banner() -> tuple[str, str]:
     days = (SENDGRID_EXPIRY - datetime.now(tz=CST)).days
     if days > 30:
@@ -607,146 +705,413 @@ def _sendgrid_banner() -> tuple[str, str]:
 
 
 def _job_rows_html(jobs: list[dict], link_color: str) -> str:
+    """
+    Renders each job in the format:
+      [Company] Job Title — Time
+      ——————————————————————————
+      reason / notes
+    """
     if not jobs:
-        return '<p style="color:#888;font-size:13px;margin:0 0 12px 0;">None found this run.</p>'
-    rows = ""
+        return '<p style="color:#888;font-size:13px;margin:4px 0 16px 0;font-style:italic;">None found this run.</p>'
+
+    parts = []
     for j in jobs:
-        title  = (j.get("title") or "Untitled").replace("<", "&lt;").replace(">", "&gt;")
-        reason = (j.get("reason") or "").replace("<", "&lt;")[:100]
-        source = (j.get("source") or "").replace("<", "&lt;")
-        url    = j.get("url", "#")
-        rows += (
-            f'<tr><td style="padding:8px 10px;border-bottom:1px solid #eee;">'
-            f'<a href="{url}" style="color:{link_color};font-weight:600;">{title}</a>'
-            f'<br><small style="color:#888;">{source} — {reason}</small>'
-            f'</td></tr>\n'
+        title   = (j.get("title") or "Untitled").replace("<", "&lt;").replace(">", "&gt;")
+        reason  = (j.get("reason") or "").replace("<", "&lt;")[:120]
+        source  = (j.get("source") or "").replace("<", "&lt;")
+        url     = j.get("url", "#")
+        t       = _fmt_time(j.get("time", ""))
+        time_str = f' - [{t}]' if t else ""
+        flagged = source in FLAGGED_COMPANIES
+
+        badge = (
+            '<span style="background:#fef9c3;border:1px solid #d97706;color:#92400e;'
+            'font-size:10px;font-weight:700;padding:1px 5px;border-radius:3px;'
+            'margin-right:5px;vertical-align:middle;">★ PRIORITY</span>'
+            if flagged else ""
         )
-    return f'<table style="width:100%;border-collapse:collapse;font-size:13px;">{rows}</table>'
+
+        parts.append(
+            f'<div style="margin-bottom:14px;">'
+            f'<div style="font-size:13px;margin-bottom:3px;">'
+            f'{badge}'
+            f'<span style="color:#555;font-weight:600;">[{source}]</span> '
+            f'<a href="{url}" style="color:{link_color};font-weight:700;text-decoration:none;">{title}</a>'
+            f'<span style="color:#999;font-size:12px;">{time_str}</span>'
+            f'</div>'
+            f'<div style="border-top:1px solid #e5e7eb;margin:4px 0 5px 0;"></div>'
+            f'<div style="color:#666;font-size:12px;">{reason}</div>'
+            f'</div>'
+        )
+    return "\n".join(parts)
+
+
+def _accenture_alert_html(all_qualify: list[dict], all_review: list[dict]) -> str:
+    """
+    Returns the Accenture AI Native SWE alert HTML only if:
+    - A job from Accenture was found this run, OR
+    - A job with AI/AI-native/February-start signals was found anywhere.
+    Returns empty string otherwise.
+    """
+    ai_re = re.compile(
+        r'\b(ai[\s\-]?native|artificial\s+intelligence|machine\s+learning|'
+        r'february\s+start|feb(?:ruary)?\s+20\d\d|starts?\s+(?:in\s+)?february)\b',
+        re.IGNORECASE,
+    )
+    for job in all_qualify + all_review:
+        src   = job.get("source", "")
+        title = job.get("title", "")
+        reason = job.get("reason", "")
+        if src == "Accenture" or ai_re.search(title) or ai_re.search(reason):
+            link = job.get("url", "https://www.accenture.com/us-en/careers/jobsearch?jk=AI+native+software+engineer&cl=us")
+            match_note = (
+                f'<a href="{link}" style="color:#0055cc;font-weight:700;">'
+                f'{"[Accenture] " + (job.get("title") or "AI Native Software Engineer") if src == "Accenture" else "Similar role found"}'
+                f'</a>'
+            )
+            return (
+                '<div style="background:#fefce8;border:2px solid #f59e0b;border-radius:7px;'
+                'padding:12px 16px;margin-bottom:18px;font-size:13px;">'
+                '<strong>⚡ Accenture AI Native SWE — FOUND:</strong> '
+                f'{match_note}'
+                '</div>'
+            )
+    return ""  # not found — no banner
+
+
+def _insights_html(source_results: list[dict], all_qualify: list[dict], all_review: list[dict]) -> str:
+    """
+    Builds the insights panel for the 12pm digest:
+    - Keyword/skill trends noticed across JDs
+    - Most active industries this run
+    - Non-tech industries hiring SWEs
+    """
+    all_jobs = all_qualify + all_review
+
+    # ── Industry activity from this run ─────────────────────────────────────────
+    industry_hits: dict[str, int] = {}
+    for job in all_jobs:
+        src = job.get("source", "")
+        entry = COMPANY_INDUSTRIES.get(src)
+        if entry:
+            ind, _ = entry
+            industry_hits[ind] = industry_hits.get(ind, 0) + 1
+
+    top_industries = sorted(industry_hits.items(), key=lambda x: -x[1])[:5]
+    top_ind_html = ""
+    if top_industries:
+        items = " &nbsp;·&nbsp; ".join(
+            f'<strong>{ind}</strong> ({n} job{"s" if n > 1 else ""})'
+            for ind, n in top_industries
+        )
+        top_ind_html = (
+            f'<p style="font-size:13px;color:#374151;margin:0 0 16px 0;">'
+            f'<strong>Most active industries this run:</strong> {items}</p>'
+        )
+
+    # ── Tech keyword trends across JD titles ───────────────────────────────────
+    TECH_STACK_KEYWORDS = [
+        "Python", "Java", "JavaScript", "TypeScript", "React", "Node",
+        "AWS", "Azure", "GCP", "SQL", "Go", "Rust", "C++", "C#", "Kotlin",
+        "Docker", "Kubernetes", "ML", "AI", "Machine Learning", "Full Stack",
+        "Backend", "Frontend", "Mobile", "iOS", "Android", "Data",
+        "Cloud", "DevOps", "Embedded", "Systems",
+    ]
+    keyword_counts: dict[str, int] = {}
+    for job in all_jobs:
+        title = job.get("title", "")
+        reason = job.get("reason", "")
+        combined = f"{title} {reason}".lower()
+        for kw in TECH_STACK_KEYWORDS:
+            if kw.lower() in combined:
+                keyword_counts[kw] = keyword_counts.get(kw, 0) + 1
+
+    top_keywords = sorted(keyword_counts.items(), key=lambda x: -x[1])[:8]
+
+    # ── Qualifying signal breakdown ────────────────────────────────────────────
+    qual_signals: dict[str, int] = {}
+    for job in all_qualify:
+        reason = job.get("reason", "")
+        # Grab the signal keyword
+        for sig in ["new grad", "entry level", "early career", "junior", "associate", "0-2", "0–2", "no experience"]:
+            if sig in reason.lower():
+                qual_signals[sig] = qual_signals.get(sig, 0) + 1
+                break
+
+    # ── Build JD observations section ─────────────────────────────────────────
+    jd_observations = ""
+    if all_jobs:
+        # Tech stack chips
+        stack_chips = ""
+        if top_keywords:
+            chips = "".join(
+                f'<span style="display:inline-block;background:#e0f2fe;color:#0369a1;'
+                f'border-radius:12px;padding:2px 10px;font-size:11px;font-weight:600;'
+                f'margin:2px 3px 2px 0;">{kw} ({n})</span>'
+                for kw, n in top_keywords
+            )
+            stack_chips = (
+                f'<div style="margin-bottom:14px;">'
+                f'<div style="font-size:12px;font-weight:700;color:#374151;margin-bottom:6px;">'
+                f'Most-requested skills across job titles this run:</div>'
+                f'<div>{chips}</div>'
+                f'</div>'
+            )
+
+        # Qualifying signals
+        signal_text = ""
+        if qual_signals:
+            sig_items = ", ".join(f'"{k}" ({v}×)' for k, v in sorted(qual_signals.items(), key=lambda x: -x[1]))
+            signal_text = (
+                f'<p style="font-size:12px;color:#374151;margin:0 0 12px 0;">'
+                f'<strong>Qualifying signals found:</strong> {sig_items}</p>'
+            )
+
+        total_seen = len(all_jobs)
+        qualify_pct = round(len(all_qualify) / total_seen * 100) if total_seen else 0
+        jd_observations = (
+            f'<div style="margin-bottom:20px;">'
+            f'<p style="font-size:12px;color:#374151;margin:0 0 10px 0;">'
+            f'Across <strong>{total_seen}</strong> new job{"s" if total_seen != 1 else ""} crawled this run, '
+            f'<strong>{len(all_qualify)}</strong> ({qualify_pct}%) matched entry-level signals and '
+            f'<strong>{len(all_review)}</strong> need a manual check.</p>'
+            f'{signal_text}'
+            f'{stack_chips}'
+            f'</div>'
+        )
+    else:
+        jd_observations = (
+            f'<p style="font-size:12px;color:#9ca3af;font-style:italic;margin:0 0 16px 0;">'
+            f'No new JDs crawled this run — no page changes detected.</p>'
+        )
+
+    # ── Non-tech sectors panel ─────────────────────────────────────────────────
+    sector_rows = ""
+    for industry, note, companies in NON_TECH_INDUSTRY_NOTES:
+        co_list = ", ".join(companies)
+        active  = industry_hits.get(industry, 0)
+        active_badge = (
+            f' <span style="background:#dcfce7;color:#166534;border-radius:3px;'
+            f'font-size:11px;padding:1px 5px;font-weight:700;">↑ {active} new</span>'
+            if active else ""
+        )
+        sector_rows += (
+            f'<div style="margin-bottom:14px;padding-bottom:14px;border-bottom:1px solid #e5e7eb;">'
+            f'<div style="font-size:13px;font-weight:700;color:#1e3a5f;margin-bottom:3px;">'
+            f'{industry}{active_badge}</div>'
+            f'<div style="font-size:12px;color:#374151;margin-bottom:3px;">{note}</div>'
+            f'<div style="font-size:11px;color:#9ca3af;">Companies in watchlist: {co_list}</div>'
+            f'</div>'
+        )
+
+    return (
+        f'<div style="background:#f8fafc;border:1px solid #cbd5e1;border-radius:8px;'
+        f'padding:18px 20px;margin-top:28px;">'
+        f'<h2 style="font-size:15px;color:#1e3a5f;margin:0 0 4px 0;'
+        f'border-bottom:2px solid #cbd5e1;padding-bottom:8px;">'
+        f'📊 What the Monitor Noticed Today</h2>'
+        f'<p style="font-size:11px;color:#9ca3af;margin:8px 0 16px 0;">'
+        f'Patterns and signals extracted across all job descriptions crawled this run.</p>'
+        f'{top_ind_html}'
+        f'{jd_observations}'
+        f'<h3 style="font-size:13px;color:#374151;margin:16px 0 10px 0;'
+        f'border-top:1px solid #e5e7eb;padding-top:14px;">'
+        f'🌐 Non-Tech Industries That Hire SWEs</h3>'
+        f'<p style="font-size:12px;color:#6b7280;margin:0 0 14px 0;">'
+        f'Not all tech jobs live at tech companies. These industries actively hire SWEs '
+        f'— and usually with less competition than Big Tech.</p>'
+        f'{sector_rows}'
+        f'</div>'
+    )
 
 
 def build_html(source_results, all_qualify, all_review, total_disq,
-               run_time, is_scheduled, changed_sources):
-    label = "12pm CST Digest" if is_scheduled else (
-        f"🆕 {len(all_qualify)} Qualifying Job{'s' if len(all_qualify) != 1 else ''}"
-        if all_qualify else "Job Alert"
-    )
+               run_time, is_scheduled, is_hourly, changed_sources):
     accessible = sum(1 for r in source_results if r["accessible"])
     blocked    = len(source_results) - accessible
     sg_html, _ = _sendgrid_banner()
+    accenture_html = _accenture_alert_html(all_qualify, all_review)
 
-    changed_note = ""
-    if changed_sources:
-        names = ", ".join(changed_sources[:8]) + ("…" if len(changed_sources) > 8 else "")
-        changed_note = (
-            f'<div style="background:#fef9c3;border:1px solid #d97706;border-radius:6px;'
-            f'padding:10px 14px;margin-bottom:14px;font-size:13px;">'
-            f'<strong>🆕 Sources with page changes:</strong> {names}</div>'
-        )
+    # ── Header label ────────────────────────────────────────────────────────────
+    if is_hourly:
+        header_label    = "⏰ Hourly Check"
+        header_subtitle = f"Scanning all {len(source_results)} sources for new listings since last run"
+        header_bg       = "#1e3a5f"
+    elif is_scheduled:
+        header_label    = "📬 Daily Job Search Digest"
+        header_subtitle = "Your curated new-grad SWE opportunities — updated daily at 12pm CST"
+        header_bg       = "#0f172a"
+    else:
+        header_label    = "🔍 On-Demand Run"
+        header_subtitle = f"Manual check across all {len(source_results)} sources"
+        header_bg       = "#0f172a"
 
+    nq  = len(all_qualify)
+    nr  = len(all_review)
+    summary_line = (
+        f'{accessible}/{len(source_results)} sources accessible &nbsp;·&nbsp; '
+        f'✅ {nq} qualifying &nbsp;·&nbsp; 🔍 {nr} review &nbsp;·&nbsp; ✗ {total_disq} disqualified'
+    )
+
+    # ── Blocked sources (collapsed) ──────────────────────────────────────────────
     blocked_rows = "".join(
         f'<tr>'
         f'<td style="padding:4px 8px;font-size:12px;">{r["name"]}</td>'
-        f'<td style="padding:4px 8px;font-size:12px;color:#888;">{r.get("error", "blocked")}</td>'
+        f'<td style="padding:4px 8px;font-size:12px;color:#888;">{r.get("error","blocked")}</td>'
         f'<td style="padding:4px 8px;font-size:12px;">'
         f'<a href="{r["url"]}" style="color:#0055cc;">Visit →</a></td></tr>\n'
         for r in source_results if not r["accessible"]
     )
-    blocked_table = (
-        f'<details style="margin-top:14px;font-size:13px;">'
-        f'<summary style="cursor:pointer;color:#666;">'
-        f'{blocked} source{"s" if blocked != 1 else ""} blocked/inaccessible (expand)</summary>'
+    blocked_section = (
+        f'<details style="margin-top:10px;font-size:12px;">'
+        f'<summary style="cursor:pointer;color:#9ca3af;">'
+        f'{blocked} source{"s" if blocked != 1 else ""} blocked / inaccessible — click to expand</summary>'
         f'<table style="width:100%;border-collapse:collapse;margin-top:8px;">{blocked_rows}</table>'
         f'</details>'
     ) if blocked_rows else ""
 
+    # ── Job sections ─────────────────────────────────────────────────────────────
+    qualify_section = (
+        f'<h2 style="font-size:15px;border-bottom:2px solid #166534;padding-bottom:6px;'
+        f'color:#166534;margin-top:24px;">✅ Qualifying Jobs ({nq})</h2>'
+        f'<p style="font-size:11px;color:#9ca3af;margin:0 0 10px 0;">'
+        f'JD or title explicitly says entry level / new grad / 0–2 yr experience</p>'
+        f'{_job_rows_html(all_qualify, "#166534")}'
+    )
+    review_section = (
+        f'<h2 style="font-size:15px;border-bottom:2px solid #92400e;padding-bottom:6px;'
+        f'color:#92400e;margin-top:24px;">🔍 Needs Review ({nr})</h2>'
+        f'<p style="font-size:11px;color:#9ca3af;margin:0 0 10px 0;">'
+        f'No clear experience signal — check the JD manually</p>'
+        f'{_job_rows_html(all_review, "#92400e")}'
+    )
+    disq_note = (
+        f'<div style="margin-top:10px;padding:7px 12px;background:#f1f5f9;'
+        f'border-radius:4px;font-size:12px;color:#9ca3af;">'
+        f'✗ {total_disq} job{"s" if total_disq != 1 else ""} disqualified '
+        f'(title or JD says senior / 3+ years) — not shown above.</div>'
+    )
+
+    # ── Profile chip ─────────────────────────────────────────────────────────────
+    profile_chip = (
+        '<div style="margin-top:20px;padding:10px 14px;background:#f0fdf4;'
+        'border:1px solid #86efac;border-radius:6px;font-size:11px;color:#166534;">'
+        '<strong>Profile:</strong> Full stack SWE · '
+        'Python, JS/TS, React, AWS, PostgreSQL · open to relocation · available immediately'
+        '</div>'
+    )
+
+    # ── Digest-only extras ───────────────────────────────────────────────────────
+    insights_section = (
+        _insights_html(source_results, all_qualify, all_review)
+        if is_scheduled else ""
+    )
+
+    footer = (
+        '<p style="font-size:11px;color:#9ca3af;margin-top:20px;text-align:center;">'
+        'Blocked sources are <em>not</em> closed — visit links directly. &nbsp;|&nbsp; '
+        'Digest: daily at 12pm CST &nbsp;|&nbsp; Hourly change detection'
+        '</p>'
+    )
+
+    # ── Newsletter intro (digest only) ───────────────────────────────────────────
+    newsletter_intro = ""
+    if is_scheduled:
+        nq_phrase  = f"<strong>{nq} qualifying role{'s' if nq != 1 else ''}</strong>" if nq else "no qualifying roles"
+        nr_phrase  = f"<strong>{nr} to review</strong>" if nr else "nothing flagged for review"
+        newsletter_intro = (
+            f'<div style="border-left:4px solid #0f172a;padding:12px 16px;'
+            f'background:#f9fafb;margin-bottom:20px;border-radius:0 6px 6px 0;">'
+            f'<p style="margin:0;font-size:14px;color:#374151;line-height:1.6;">'
+            f"Today's scan turned up {nq_phrase} and {nr_phrase} across "
+            f'<strong>{accessible}</strong> accessible sources. '
+            f'Flagged companies appear first in each section below.</p>'
+            f'</div>'
+        )
+
     return f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Job Monitor — {label}</title></head>
+<title>Job Monitor — {header_label}</title></head>
 <body style="font-family:Arial,Helvetica,sans-serif;max-width:860px;margin:0 auto;padding:20px;color:#222;">
 
-<div style="background:#0f172a;color:#f8fafc;padding:18px 22px;border-radius:8px;margin-bottom:18px;">
-  <h1 style="margin:0;font-size:20px;letter-spacing:0.3px;">🔍 Job Monitor — {label}</h1>
-  <p style="margin:6px 0 0;opacity:0.75;font-size:13px;">
-    Run: {run_time} &nbsp;|&nbsp; {accessible}/{len(source_results)} sources accessible ·
-    ✅ {len(all_qualify)} qualifying · 🔍 {len(all_review)} review · ✗ {total_disq} disqualified
-  </p>
+<div style="background:{header_bg};color:#f8fafc;padding:18px 22px;border-radius:8px;margin-bottom:18px;">
+  <h1 style="margin:0;font-size:20px;letter-spacing:0.3px;">{header_label}</h1>
+  <p style="margin:5px 0 0;opacity:0.85;font-size:13px;">{header_subtitle}</p>
+  <p style="margin:6px 0 0;opacity:0.65;font-size:12px;">{run_time} &nbsp;·&nbsp; {summary_line}</p>
 </div>
 
 {sg_html}
-
-<div style="background:#fefce8;border:1px solid #f59e0b;border-radius:6px;padding:12px 16px;margin-bottom:18px;font-size:13px;">
-  <strong>⚡ Priority watch — Accenture AI Native Software Engineer:</strong>
-  Role expected to open ~Nov 15–16 with February start.
-  <a href="https://www.accenture.com/us-en/careers/jobsearch?jk=AI+native+software+engineer&cl=us" style="color:#0055cc;">
-    Search Accenture →
-  </a>
-</div>
-
-{changed_note}
-
-<h2 style="font-size:16px;border-bottom:2px solid #166534;padding-bottom:6px;color:#166534;margin-top:0;">
-  ✅ Qualifying Jobs ({len(all_qualify)})
-</h2>
-<p style="font-size:12px;color:#666;margin:0 0 10px;">
-  JD or title explicitly says entry level / new grad / 0–2 yr experience
-</p>
-{_job_rows_html(all_qualify, "#166534")}
-
-<h2 style="font-size:16px;border-bottom:2px solid #92400e;padding-bottom:6px;color:#92400e;margin-top:28px;">
-  🔍 Needs Review ({len(all_review)})
-</h2>
-<p style="font-size:12px;color:#666;margin:0 0 10px;">
-  No clear experience signal found — check the JD manually
-</p>
-{_job_rows_html(all_review, "#92400e")}
-
-<div style="margin-top:12px;padding:8px 12px;background:#f1f5f9;border-radius:4px;font-size:12px;color:#666;">
-  ✗ {total_disq} job{"s" if total_disq != 1 else ""} disqualified
-  (title or JD says senior / 3+ years) — not shown above.
-</div>
-
-{blocked_table}
-
-<div style="margin-top:24px;padding:12px 16px;background:#f0fdf4;border:1px solid #86efac;border-radius:6px;font-size:12px;color:#166534;">
-  <strong>Profile:</strong> Full stack SWE · 
-  Python, JavaScript/TypeScript, React, AWS, PostgreSQL · open to relocation · available immediately
-</div>
-
-<p style="font-size:11px;color:#999;margin-top:18px;">
-  Sources marked blocked are <em>not</em> closed — click links to visit directly.
-  Digest runs daily at 12pm CST · Hourly change detection.
-</p>
+{newsletter_intro}
+{accenture_html}
+{qualify_section}
+{review_section}
+{disq_note}
+{blocked_section}
+{profile_chip}
+{insights_section}
+{footer}
 </body></html>"""
 
 
 def build_text(source_results, all_qualify, all_review, total_disq,
-               run_time, is_scheduled, changed_sources):
+               run_time, is_scheduled, is_hourly, changed_sources):
     _, sg_text = _sendgrid_banner()
-    label = "12pm CST Digest" if is_scheduled else (
-        f"{len(all_qualify)} QUALIFYING JOBS FOUND" if all_qualify else "JOB ALERT"
-    )
+    accessible = sum(1 for r in source_results if r["accessible"])
+
+    if is_hourly:
+        label    = "⏰ HOURLY CHECK"
+        sublabel = f"Scanning all {len(source_results)} sources for new listings since last run"
+    elif is_scheduled:
+        label    = "📬 DAILY JOB SEARCH DIGEST"
+        sublabel = "Your curated new-grad SWE opportunities — 12pm CST"
+    else:
+        label    = "JOB MONITOR — ON-DEMAND"
+        sublabel = ""
+
     lines = [
-        f"JOB MONITOR — {label}",
+        label,
+    ]
+    if sublabel:
+        lines.append(sublabel)
+    lines += [
         f"Run: {run_time}",
+        f"{accessible}/{len(source_results)} sources accessible · "
+        f"✅ {len(all_qualify)} qualifying · 🔍 {len(all_review)} review · ✗ {total_disq} disqualified",
         "=" * 60,
         "",
-        "⚡ PRIORITY: Accenture AI Native SWE",
-        "   https://www.accenture.com/us-en/careers/jobsearch?jk=AI+native+software+engineer&cl=us",
-        "",
     ]
+
     if sg_text:
         lines += [sg_text, ""]
-    if changed_sources:
-        lines += [f"🆕 PAGE CHANGES: {', '.join(changed_sources)}", ""]
+
+    # Accenture alert only if found
+    ai_re = re.compile(
+        r'\b(ai[\s\-]?native|artificial\s+intelligence|machine\s+learning|'
+        r'february\s+start|feb(?:ruary)?\s+20\d\d|starts?\s+(?:in\s+)?february)\b',
+        re.IGNORECASE,
+    )
+    for job in all_qualify + all_review:
+        src = job.get("source", "")
+        if src == "Accenture" or ai_re.search(job.get("title", "")) or ai_re.search(job.get("reason", "")):
+            lines += [
+                "⚡ ACCENTURE AI NATIVE SWE FOUND:",
+                f"   {job.get('title', 'Role found')} — {job.get('url', '')}",
+                "",
+            ]
+            break
 
     lines += ["✅ QUALIFYING JOBS", "-" * 40]
     if all_qualify:
         for j in all_qualify:
+            t = _fmt_time(j.get("time", ""))
+            time_str = f" - [{t}]" if t else ""
+            priority = "★ PRIORITY  " if j.get("source", "") in FLAGGED_COMPANIES else ""
             lines += [
-                f"  {j.get('title', 'Untitled')}",
-                f"  Source: {j.get('source', '')} — {j.get('reason', '')}",
-                f"  {j['url']}",
+                f"  {priority}[{j.get('source', '')}] {j.get('title', 'Untitled')}{time_str}",
+                f"  ——",
+                f"  {j.get('reason', '')}",
+                f"  {j.get('url', '')}",
                 "",
             ]
     else:
@@ -755,10 +1120,14 @@ def build_text(source_results, all_qualify, all_review, total_disq,
     lines += ["🔍 NEEDS REVIEW", "-" * 40]
     if all_review:
         for j in all_review:
+            t = _fmt_time(j.get("time", ""))
+            time_str = f" - [{t}]" if t else ""
+            priority = "★ PRIORITY  " if j.get("source", "") in FLAGGED_COMPANIES else ""
             lines += [
-                f"  {j.get('title', 'Untitled')}",
-                f"  Source: {j.get('source', '')} — {j.get('reason', '')}",
-                f"  {j['url']}",
+                f"  {priority}[{j.get('source', '')}] {j.get('title', 'Untitled')}{time_str}",
+                f"  ——",
+                f"  {j.get('reason', '')}",
+                f"  {j.get('url', '')}",
                 "",
             ]
     else:
@@ -767,8 +1136,48 @@ def build_text(source_results, all_qualify, all_review, total_disq,
     lines += [
         f"✗ {total_disq} disqualified (senior / 3+ years) — not shown.",
         "",
-        "Blocked sources are NOT closed — visit links manually.",
+        "Blocked sources are NOT closed — visit links directly.",
     ]
+
+    if is_scheduled:
+        # Keyword trends
+        TECH_STACK_KEYWORDS = [
+            "Python", "Java", "JavaScript", "TypeScript", "React", "Node",
+            "AWS", "Azure", "GCP", "SQL", "Go", "Rust", "C++", "C#",
+            "Docker", "Kubernetes", "ML", "AI", "Machine Learning",
+            "Full Stack", "Backend", "Frontend", "Mobile", "Data", "Cloud",
+        ]
+        keyword_counts: dict[str, int] = {}
+        for j in all_qualify + all_review:
+            combined = f"{j.get('title','')} {j.get('reason','')}".lower()
+            for kw in TECH_STACK_KEYWORDS:
+                if kw.lower() in combined:
+                    keyword_counts[kw] = keyword_counts.get(kw, 0) + 1
+        top_kw = sorted(keyword_counts.items(), key=lambda x: -x[1])[:6]
+
+        lines += [
+            "",
+            "=" * 60,
+            "📊 WHAT THE MONITOR NOTICED TODAY",
+            "-" * 40,
+        ]
+        if top_kw:
+            kw_str = "  " + "  ·  ".join(f"{kw} ({n})" for kw, n in top_kw)
+            lines += ["Most-requested skills across JD titles:", kw_str, ""]
+
+        lines += [
+            "🌐 NON-TECH INDUSTRIES HIRING SWEs",
+            "-" * 40,
+            "Not all tech jobs live at tech companies.",
+            "",
+        ]
+        for industry, note, companies in NON_TECH_INDUSTRY_NOTES:
+            lines += [
+                f"• {industry} ({', '.join(companies)})",
+                f"  {note}",
+                "",
+            ]
+
     return "\n".join(lines)
 
 
@@ -841,7 +1250,7 @@ async def run_async(is_scheduled: bool, is_hourly: bool):
         sys.exit(1)
 
     now_cst  = datetime.now(tz=CST)
-    run_time = now_cst.strftime("%Y-%m-%d %H:%M CST")
+    run_time = now_cst.strftime("%B %-d, %Y %-I:%M %p CST")
     mode     = "scheduled" if is_scheduled else ("hourly" if is_hourly else "on-demand")
     max_jobs = MAX_JOBS_HOURLY if is_hourly else MAX_JOBS_DAILY
 
@@ -880,6 +1289,12 @@ async def run_async(is_scheduled: bool, is_hourly: bool):
             all_review.append({**j, "source": r["name"], "source_url": r["url"]})
         total_disq += r.get("jobs_disqualify_count", 0)
 
+    # Flagged companies always appear first in results
+    def _flagged_first(job: dict) -> int:
+        return 0 if job.get("source", "") in FLAGGED_COMPANIES else 1
+    all_qualify.sort(key=_flagged_first)
+    all_review.sort(key=_flagged_first)
+
     print(
         f"\n  Results: ✅ {len(all_qualify)} qualifying | "
         f"🔍 {len(all_review)} review | ✗ {total_disq} disqualified | "
@@ -909,9 +1324,9 @@ async def run_async(is_scheduled: bool, is_hourly: bool):
         )
         subject = f"[Job Monitor] {subj_tag} — {run_time}"
         html = build_html(source_results, all_qualify, all_review, total_disq,
-                          run_time, is_scheduled, changed_srcs)
+                          run_time, is_scheduled, is_hourly, changed_srcs)
         text = build_text(source_results, all_qualify, all_review, total_disq,
-                          run_time, is_scheduled, changed_srcs)
+                          run_time, is_scheduled, is_hourly, changed_srcs)
         ok, msg = send_email(subject, html, text, NOTIFY_EMAIL)
         print(f"  {'✅' if ok else '❌'} Email ({subj_tag}): {msg}")
         if not ok:
