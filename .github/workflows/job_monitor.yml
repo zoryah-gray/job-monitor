@@ -3,7 +3,8 @@ name: Job Monitor
 on:
   schedule:
     - cron: '0 18 * * *'   # Daily 12pm CST digest (UTC-6 → 18:00 UTC)
-    - cron: '0 * * * *'    # Hourly change detection (silent unless new postings found)
+    - cron: '0 0-17,19-23 * * *'   # Hourly change detection (silent unless new postings found);
+                                   # skips 18:00 UTC, when the daily digest already runs
   workflow_dispatch:
     inputs:
       mode:
@@ -14,6 +15,11 @@ on:
         options:
           - scheduled
           - hourly
+      use_ai:
+        description: 'Hourly mode only: score jobs with Claude (--use-ai). The daily digest always uses AI.'
+        required: false
+        default: false
+        type: boolean
 
 jobs:
   monitor:
@@ -32,30 +38,41 @@ jobs:
       - name: Restore state cache
         uses: actions/cache/restore@v4
         with:
-          path: job_monitor_state.json
+          path: job_monitor_agent/job_monitor_state.json
           key: job-monitor-state-${{ github.run_id }}
           restore-keys: |
             job-monitor-state-
 
       - name: Install dependencies
+        working-directory: job_monitor_agent
         run: |
           pip install playwright beautifulsoup4
           playwright install chromium --with-deps
 
       - name: Run job monitor
+        working-directory: job_monitor_agent
         env:
-          NOTIFY_EMAIL: ${{ secrets.NOTIFY_EMAIL }}
-          SMTP_USER: ${{ secrets.SMTP_USER }}
-          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          NOTIFY_EMAIL:      ${{ secrets.NOTIFY_EMAIL }}
+          SMTP_USER:         ${{ secrets.SMTP_USER }}
+          SMTP_PASS:         ${{ secrets.SMTP_PASS }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          RESUME_TEXT:       ${{ secrets.RESUME_TEXT }}
+          CANDIDATE_PROFILE: ${{ secrets.CANDIDATE_PROFILE }}
+          SCHEDULE:          ${{ github.event.schedule }}
+          DISPATCH_MODE:     ${{ github.event.inputs.mode }}
+          DISPATCH_USE_AI:   ${{ github.event.inputs.use_ai }}
+          HOURLY_USE_AI:     ${{ vars.HOURLY_USE_AI }}   # repo variable; 'true' = AI on scheduled hourly runs
         run: |
-          SCHEDULE="${{ github.event.schedule }}"
-          DISPATCH_MODE="${{ github.event.inputs.mode }}"
           if [ "$SCHEDULE" = "0 18 * * *" ] || [ "$DISPATCH_MODE" = "scheduled" ]; then
-            echo "Mode: --scheduled (daily digest)"
+            echo "Mode: --scheduled (daily digest, AI on)"
             python3 job_monitor.py --scheduled
           else
-            echo "Mode: --hourly (change detection)"
-            python3 job_monitor.py --hourly
+            AI_FLAG=""
+            if [ "$DISPATCH_USE_AI" = "true" ] || [ "$HOURLY_USE_AI" = "true" ]; then
+              AI_FLAG="--use-ai"
+            fi
+            echo "Mode: --hourly ${AI_FLAG:-(AI off)}"
+            python3 job_monitor.py --hourly $AI_FLAG
           fi
 
       # Always save updated state so next run has fresh page hashes
@@ -63,5 +80,5 @@ jobs:
         uses: actions/cache/save@v4
         if: always()
         with:
-          path: job_monitor_state.json
+          path: job_monitor_agent/job_monitor_state.json
           key: job-monitor-state-${{ github.run_id }}

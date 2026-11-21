@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Daily 12pm CST digest — always sends the full email -->
+    <key>Label</key>
+    <string>com.jobmonitor.daily</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <!-- launchd does not expand $HOME, so let bash do it (keeps the username out of git) -->
+        <string>/bin/bash</string>
+        <string>-c</string>
+        <string>exec "$HOME/Documents/Claude Code/job_monitor_agent_repo/job_monitor_agent/job_monitor_run.sh" --scheduled</string>
+    </array>
+
+    <!-- Noon CST = 18:00 UTC (CST is UTC-6) -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>18</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/job_monitor_daily.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/job_monitor_daily_err.log</string>
+
+    <!-- Run missed fires when Mac wakes (e.g. if it was asleep at noon) -->
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>

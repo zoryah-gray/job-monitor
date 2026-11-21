@@ -11,6 +11,7 @@ Run:
   python3 job_monitor.py              # on-demand (always sends email)
   python3 job_monitor.py --scheduled  # 12pm CST digest label
   python3 job_monitor.py --hourly     # sends only if new qualify/review jobs found
+  python3 job_monitor.py --use-ai     # enable Claude fit scoring outside the daily digest
 
 Quiet hours: no emails 12am–7am CST regardless of mode.
 """
@@ -26,6 +27,7 @@ import sys
 from datetime import datetime, timezone, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from html import escape as _esc
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin, urlparse
@@ -47,11 +49,21 @@ except ImportError:
 # ── Constants ───────────────────────────────────────────────────────────────────
 CST             = timezone(timedelta(hours=-6))
 NOTIFY_EMAIL    = os.environ.get("NOTIFY_EMAIL", "")
+CANDIDATE_PROFILE = os.environ.get("CANDIDATE_PROFILE", "")
 STATE_FILE      = Path(__file__).parent / "job_monitor_state.json"
 MAX_JOBS_DAILY  = 25   # max new JD pages to deep-crawl per source, full run
 MAX_JOBS_HOURLY = 10   # max new JD pages to deep-crawl per source, hourly run
 MAX_STATE_URLS  = 2000 # cap on seen_job_urls entries in state
-SENDGRID_EXPIRY = datetime(2027, 1, 15, tzinfo=CST)
+
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+RESUME_TEXT_ENV   = os.environ.get("RESUME_TEXT", "")
+SMTP_USER         = os.environ.get("SMTP_USER", "")
+SMTP_PASS         = os.environ.get("SMTP_PASS", "")
+
+HAIKU_MODEL  = "claude-haiku-5-5"
+SONNET_MODEL = "claude-sonnet-5-5"
+
+MAX_JD_CHARS = 3000   # characters of JD text stored per job in state
 
 # ── Priority / flagged companies ─────────────────────────────────────────────────
 # Jobs from these companies are sorted to the top of email results.
@@ -143,8 +155,7 @@ NON_TECH_INDUSTRY_NOTES: list[tuple[str, str, list[str]]] = [
 # ── Company career sites ─────────────────────────────────────────────────────────
 COMPANIES = [
     {"name": "Accenture",
-     "url":  "https://www.accenture.com/us-en/careers/jobsearch?jk=software+engineer+AI+native&cl=us",
-     "note": "⚡ AI Native SWE role expected ~Nov 15-16 with Feb start — check manually"},
+     "url":  "https://www.accenture.com/us-en/careers/jobsearch?jk=software+engineer+AI+native&cl=us"},
     {"name": "Adobe",
      "url":  "https://careers.adobe.com/us/en/search-results?keywords=software%20engineer&country=United%20States"},
     {"name": "Amazon",
@@ -334,6 +345,10 @@ def load_state() -> dict:
             data["page_hashes"] = data.pop("content_hashes")
         data.setdefault("page_hashes", {})
         data.setdefault("seen_job_urls", {})
+        # Migrate pre-digest-flag entries: they were already emailed by the old
+        # system, so treat them as digested instead of flooding the next digest.
+        for entry in data["seen_job_urls"].values():
+            entry.setdefault("in_digest", True)
         return data
     except (FileNotFoundError, json.JSONDecodeError):
         return {"page_hashes": {}, "seen_job_urls": {}}
@@ -459,6 +474,42 @@ def _text_from_html(html: str) -> str:
     # Fallback: strip HTML tags
     text = re.sub(r"<[^>]+>", " ", html)
     return re.sub(r"\s+", " ", text).strip()
+
+
+# Sentences that are EEO / legal or benefits boilerplate. Dropping them before the
+# JD is truncated to MAX_JD_CHARS keeps more of the actual role in the prompt.
+# Patterns are deliberately specific ("medical, dental", not "medical") so real
+# content such as "medical devices" or "accessibility" survives.
+_BOILERPLATE_RE = re.compile(
+    r"""(?:
+        # EEO / legal
+        equal\s+(?:employment\s+)?opportunity | \bEEO\b | affirmative\s+action |
+        (?:without\s+regard|regardless)\s+(?:to|of)\s+(?:race|color|religion|sex|age|gender) |
+        sexual\s+orientation | gender\s+identity | national\s+origin |
+        protected\s+veteran | veteran\s+status | (?:disability|genetic\s+information)\s+status |
+        reasonable\s+accommodations? | \bE-?Verify\b | pay\s+transparency |
+        know\s+your\s+rights | drug[\s-]free\s+workplace | fair\s+chance |
+        # Benefits
+        \b401\s*\(?k\)? | medical,\s*dental | dental(?:,|\s+and)\s+vision | health\s+insurance |
+        paid\s+time\s+off | \bPTO\b | (?:parental|maternity|paternity)\s+leave |
+        tuition\s+(?:reimbursement|assistance) | employee\s+stock\s+purchase | \bESPP\b |
+        life\s+insurance | disability\s+insurance | wellness\s+program | commuter\s+benefits |
+        (?:competitive|comprehensive|generous)\s+benefits | benefits\s+package |
+        (?:our|the)\s+benefits\s+include | paid\s+holidays
+    )""",
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def _trim_jd_boilerplate(text: str) -> str:
+    """Remove EEO/legal and benefits sentences from scraped JD text."""
+    if not text:
+        return text
+    sentences = re.split(r"(?<=[.!?])\s+", text)
+    kept = [s for s in sentences if not _BOILERPLATE_RE.search(s)]
+    trimmed = re.sub(r"\s+", " ", " ".join(kept)).strip()
+    # Safety net: if almost everything matched, the page was unusual — keep the original.
+    return trimmed if len(trimmed) >= 200 else text
 
 
 def _title_from_html(html: str) -> str:
@@ -631,9 +682,13 @@ async def crawl_source(browser: Browser, source: dict, state: dict, max_jobs: in
             seen[jd_url] = {
                 "title":      "",
                 "source":     name,
-                "first_seen": now,
+                "first_seen": datetime.now(CST).isoformat(),
                 "verdict":    "review",
                 "reason":     f"JD inaccessible: {jd_err}",
+                "jd_text":    None,
+                "fit_score":  None,
+                "reasoning":  [],
+                "in_digest":  False,
             }
             result["jobs_review"].append({
                 "title":  f"[Job link from {name}]",
@@ -650,9 +705,14 @@ async def crawl_source(browser: Browser, source: dict, state: dict, max_jobs: in
             seen[jd_url] = {
                 "title":      title,
                 "source":     name,
-                "first_seen": now,
+                "first_seen": datetime.now(CST).isoformat(),
                 "verdict":    verdict,
                 "reason":     reason,
+                "jd_text":    (_trim_jd_boilerplate(jd_text)[:MAX_JD_CHARS]
+                               if jd_text and verdict != "disqualify" else None),
+                "fit_score":  None,
+                "reasoning":  [],
+                "in_digest":  False,
             }
             if verdict == "qualify":
                 result["jobs_qualify"].append({"title": title, "url": jd_url, "reason": reason, "time": now})
@@ -671,6 +731,292 @@ async def crawl_source(browser: Browser, source: dict, state: dict, max_jobs: in
     return result
 
 
+# ── Resume ───────────────────────────────────────────────────────────────────────
+def load_resume() -> str:
+    """Load resume text: env var first (GitHub Actions), then local PDF."""
+    if RESUME_TEXT_ENV:
+        return RESUME_TEXT_ENV.strip()
+    resume_path = Path(__file__).parent / "resume.pdf"
+    if resume_path.exists():
+        try:
+            import pdfplumber
+            with pdfplumber.open(str(resume_path)) as pdf:
+                return "\n".join(page.extract_text() or "" for page in pdf.pages).strip()
+        except Exception as e:
+            print(f"  Warning: could not read resume.pdf ({type(e).__name__}: {e})")
+    return ""
+
+
+# ── Claude fit scoring ───────────────────────────────────────────────────────────
+# Structured-output schemas: the API constrains the reply to these shapes, so
+# parsing can't fail on stray prose or fences. (The property is named
+# "explanation", not "reasoning": the docs warn that a property asking for the
+# model's reasoning can trigger a `reasoning_extraction` refusal.)
+SCORE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "fit_score":        {"type": "integer", "description": "1-100"},
+        "explanation":      {"type": "array", "items": {"type": "string"}},
+        "likely_qualifies": {"type": "boolean"},
+    },
+    "required": ["fit_score", "explanation", "likely_qualifies"],
+    "additionalProperties": False,
+}
+PICKS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "picks": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "index":     {"type": "integer"},
+                    "highlight": {"type": "string"},
+                },
+                "required": ["index", "highlight"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["picks"],
+    "additionalProperties": False,
+}
+
+
+MAX_CONCURRENT_API = 5   # simultaneous Claude requests (keeps big digests under rate limits)
+MAX_API_RETRIES    = 3   # retries for 429 / 5xx / 529 / network errors
+_RETRY_STATUSES    = {429, 500, 502, 503, 504, 529}
+_API_SEMAPHORES: dict = {}   # one semaphore per event loop
+
+# Per-run token usage, keyed by model. Printed at the end of the run and kept in
+# state["ai_usage_log"] so the current setup can be compared against the Batch API later.
+AI_USAGE: dict[str, dict[str, int]] = {}
+
+
+def _api_semaphore() -> asyncio.Semaphore:
+    loop = asyncio.get_running_loop()
+    if loop not in _API_SEMAPHORES:
+        _API_SEMAPHORES.clear()
+        _API_SEMAPHORES[loop] = asyncio.Semaphore(MAX_CONCURRENT_API)
+    return _API_SEMAPHORES[loop]
+
+
+def _record_usage(model: str, usage: dict):
+    u = AI_USAGE.setdefault(model, {"requests": 0, "input_tokens": 0, "output_tokens": 0,
+                                    "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0})
+    u["requests"] += 1
+    for k in ("input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"):
+        u[k] += int(usage.get(k) or 0)
+
+
+def _claude_payload(model: str, prompt: str, schema: dict, max_tokens: int = 2048,
+                    system: str | None = None) -> dict:
+    """Common request body. Low effort keeps adaptive thinking short for a simple
+    scoring task; max_tokens leaves room for any thinking plus the JSON answer.
+    `system` is sent as a cached block: it must be identical across calls."""
+    payload = {
+        "model":         model,
+        "max_tokens":    max_tokens,
+        "messages":      [{"role": "user", "content": prompt}],
+        "output_config": {
+            "effort": "low",
+            "format": {"type": "json_schema", "schema": schema},
+        },
+    }
+    if system:
+        payload["system"] = [{"type": "text", "text": system,
+                              "cache_control": {"type": "ephemeral"}}]
+    if model == SONNET_MODEL:
+        # Server-side refusal fallback (beta). Claude Haiku 5.5 has none.
+        payload["fallbacks"] = "default"
+    return payload
+
+
+async def _call_claude_async(payload: dict) -> dict | None:
+    """Make one Anthropic API call via the thread pool, with a concurrency cap
+    and retries (honoring retry-after) for rate limits and transient errors."""
+    import json as _json
+    import ssl
+    from urllib.request import Request, urlopen
+    from urllib.error import HTTPError
+
+    headers = {
+        "x-api-key":         ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+        "content-type":      "application/json",
+    }
+    if "fallbacks" in payload:
+        headers["anthropic-beta"] = "server-side-fallback-2026-07-01"
+    data = _json.dumps(payload).encode()
+    ctx  = ssl.create_default_context()
+
+    async with _api_semaphore():
+        for attempt in range(MAX_API_RETRIES + 1):
+            req = Request("https://api.anthropic.com/v1/messages",
+                          data=data, headers=headers, method="POST")
+            wait = None
+            try:
+                loop = asyncio.get_running_loop()
+                raw  = await loop.run_in_executor(
+                    None, lambda: urlopen(req, timeout=60, context=ctx).read()
+                )
+                resp = _json.loads(raw)
+                _record_usage(payload.get("model", "?"), resp.get("usage") or {})
+                return resp
+            except HTTPError as e:
+                body = e.read().decode(errors="replace")[:200]
+                if e.code in _RETRY_STATUSES and attempt < MAX_API_RETRIES:
+                    try:
+                        wait = min(float(e.headers.get("retry-after", "")), 30.0)
+                    except (TypeError, ValueError):
+                        wait = None
+                    print(f"  Claude API HTTP {e.code} — retry {attempt + 1}/{MAX_API_RETRIES}")
+                else:
+                    print(f"  Claude API HTTP {e.code}: {body}")
+                    return None
+            except Exception as e:
+                if attempt < MAX_API_RETRIES:
+                    print(f"  Claude API {type(e).__name__} — retry {attempt + 1}/{MAX_API_RETRIES}")
+                else:
+                    print(f"  Claude API error ({type(e).__name__}): {str(e)[:200]}")
+                    return None
+            await asyncio.sleep(wait if wait is not None else 2 ** (attempt + 1))
+    return None
+
+
+def _response_json(resp: dict, label: str) -> dict | None:
+    """Pull the JSON answer out of a Messages response.
+
+    Current models think by default, so content[0] is usually a `thinking`
+    block; the answer is the first `text` block. Returns None on refusal,
+    truncation, or a missing/invalid text block.
+    """
+    import json as _json
+    stop = resp.get("stop_reason")
+    if stop == "refusal":
+        cat = (resp.get("stop_details") or {}).get("category")
+        print(f"  Claude declined ({label}, category={cat}) — left unscored")
+        return None
+    if stop == "max_tokens":
+        print(f"  Claude hit max_tokens ({label}) — left unscored")
+        return None
+    text = next((b.get("text", "") for b in resp.get("content", []) if b.get("type") == "text"), "")
+    text = text.strip()
+    if text.startswith("```"):
+        lines = text.split("\n")
+        end   = -1 if lines[-1].strip().startswith("```") else len(lines)
+        text  = "\n".join(lines[1:end])
+    try:
+        return _json.loads(text)
+    except Exception as e:
+        print(f"  Parse error ({label}): {e}")
+        return None
+
+
+def _scoring_system_prompt(resume_text: str) -> str:
+    """Stable prefix shared by every scoring call (cached by the API)."""
+    return (
+        "You are evaluating job fit for a software engineering candidate. "
+        "Rate fit on a 1–100 scale where 70+ means strong candidate.\n\n"
+        "Hard-skills match on a relative scale — not having every listed skill is not a dealbreaker. "
+        "The candidate has more experience in full-stack and backend but is open to any SWE role regardless of label. "
+        "US location is fine anywhere. In-person/hybrid preferred but remote accepted.\n\n"
+        "For each job, return fit_score (integer 1-100), explanation (2 concise bullet strings on why), "
+        "and likely_qualifies (true if the candidate likely meets the requirements "
+        "even if regex did not classify this as qualifying).\n\n"
+        f"CANDIDATE PROFILE:\n{resume_text[:2000]}"
+    )
+
+
+async def score_job(job: dict, resume_text: str, model: str) -> dict:
+    """Score a single job for fit. Mutates and returns the job dict.
+    Jobs that already have a fit_score (e.g. scored by an earlier run) are skipped."""
+    if job.get("fit_score") is not None:
+        return job
+    jd_text = job.get("jd_text") or ""
+    if not ANTHROPIC_API_KEY or not resume_text or not jd_text:
+        return job
+
+    prompt = (
+        f"JOB:\nTitle: {job.get('title', 'Unknown')}\n"
+        f"Company: {job.get('source', 'Unknown')}\n"
+        f"Description:\n{jd_text[:3000]}"
+    )
+
+    resp = await _call_claude_async(_claude_payload(
+        model, prompt, SCORE_SCHEMA, system=_scoring_system_prompt(resume_text)))
+    if resp is None:
+        return job
+
+    result = _response_json(resp, job.get("url", "?"))
+    if result is None:
+        return job
+    try:
+        job["fit_score"]     = max(1, min(100, int(result.get("fit_score", 0))))
+        job["reasoning"]     = [str(x) for x in result.get("explanation", [])][:5]
+        job["maybe_qualify"] = bool(result.get("likely_qualifies", False))
+    except Exception as e:
+        print(f"  Scoring parse error ({job.get('url', '?')}): {e}")
+    return job
+
+
+async def score_jobs_parallel(jobs: list[dict], resume_text: str, model: str) -> list[dict]:
+    """Score jobs concurrently. Already-scored jobs are skipped. The first request
+    runs alone so it writes the prompt cache; the rest then read from it."""
+    if not ANTHROPIC_API_KEY or not resume_text:
+        print("  AI scoring skipped (no API key or resume text)")
+        return jobs
+    todo = [j for j in jobs if j.get("fit_score") is None and j.get("jd_text")]
+    print(f"  Scoring {len(todo)} jobs with {model} "
+          f"({len(jobs) - len(todo)} already scored or without JD text)...")
+    if todo:
+        await score_job(todo[0], resume_text, model)
+        await asyncio.gather(*[score_job(j, resume_text, model) for j in todo[1:]])
+    return jobs
+
+
+async def get_top_picks(jobs: list[dict], resume_text: str) -> list[dict]:
+    """
+    From the already-scored qualifying jobs, ask Claude to highlight the top 3.
+    Returns up to 3 job dicts with a 'highlight' string added.
+    """
+    if not ANTHROPIC_API_KEY or not resume_text or not jobs:
+        return jobs[:3]
+
+    job_lines = "\n".join(
+        f"{i+1}. {j.get('title','?')} at {j.get('source','?')} "
+        f"(fit: {j.get('fit_score','?')}) — {(j.get('jd_text') or '')[:200]}"
+        for i, j in enumerate(jobs[:10])
+    )
+
+    prompt = (
+        "From these software engineering job opportunities, pick the top 3 "
+        "that best fit this candidate and briefly explain why each is a standout pick.\n\n"
+        f"CANDIDATE PROFILE:\n{resume_text[:1000]}\n\n"
+        f"OPPORTUNITIES:\n{job_lines}\n\n"
+        "For each pick return its 1-based index from the list and a one-sentence highlight."
+    )
+
+    resp = await _call_claude_async(_claude_payload(SONNET_MODEL, prompt, PICKS_SCHEMA))
+    if resp is None:
+        return jobs[:3]
+
+    result = _response_json(resp, "top picks")
+    if result is None:
+        return jobs[:3]
+    try:
+        top = []
+        for p in result.get("picks", [])[:3]:
+            idx = int(p.get("index", 0)) - 1
+            if 0 <= idx < min(len(jobs), 10) and jobs[idx] not in top:
+                jobs[idx]["highlight"] = p.get("highlight", "")
+                top.append(jobs[idx])
+        return top if top else jobs[:3]
+    except Exception as e:
+        print(f"  Top picks parse error: {e}")
+        return jobs[:3]
+
+
 # ── Email helpers ────────────────────────────────────────────────────────────────
 
 def _fmt_time(iso_str: str) -> str:
@@ -682,101 +1028,104 @@ def _fmt_time(iso_str: str) -> str:
         return ""
 
 
-def _sendgrid_banner() -> tuple[str, str]:
-    days = (SENDGRID_EXPIRY - datetime.now(tz=CST)).days
-    if days > 30:
-        return "", ""
-    if days <= 0:
-        h = ('<div style="background:#fef2f2;border:1px solid #dc2626;border-radius:6px;'
-             'padding:12px 16px;margin-bottom:14px;font-size:13px;">'
-             '<strong>🚨 SendGrid trial EXPIRED</strong> — switch to Gmail: '
-             'add <code>SMTP_USER</code> + <code>SMTP_PASS</code> as Actions secrets '
-             'and remove <code>SENDGRID_API_KEY</code>.</div>')
-        t = "🚨 SENDGRID TRIAL EXPIRED — add SMTP_USER + SMTP_PASS secrets."
-    else:
-        icon = "🔴" if days <= 7 else "🟡"
-        h = (f'<div style="background:#fff7ed;border:1px solid #f97316;border-radius:6px;'
-             f'padding:12px 16px;margin-bottom:14px;font-size:13px;">'
-             f'{icon} <strong>SendGrid trial expires in {days} day{"s" if days != 1 else ""}</strong>'
-             f' (Jan 15 2027). Add <code>SMTP_USER</code> + <code>SMTP_PASS</code> as Actions secrets '
-             f'and remove <code>SENDGRID_API_KEY</code> before then.</div>')
-        t = f"{icon} SENDGRID TRIAL EXPIRES IN {days} DAYS (Jan 15 2027)."
-    return h, t
+# Level tags scanned (case-insensitive) in title, then JD text. First match wins.
+LEVEL_TAGS = ["Entry Level", "New Grad", "Junior", "Associate", "Mid-Level", "Senior", "Staff"]
+_LEVEL_RES = [(lvl, re.compile(r"\b" + re.escape(lvl) + r"\b", re.IGNORECASE)) for lvl in LEVEL_TAGS]
+
+TIER_COLORS = {
+    "qualify":       "#22c55e",  # green
+    "maybe_qualify": "#f59e0b",  # amber
+    "review":        "#94a3b8",  # slate
+}
 
 
-def _job_rows_html(jobs: list[dict], link_color: str) -> str:
+def _level_tag(job: dict) -> str:
+    """Return the first level string found in the title, else in jd_text; '' if none."""
+    for text in (job.get("title") or "", job.get("jd_text") or ""):
+        for lvl, rx in _LEVEL_RES:
+            if rx.search(text):
+                return lvl
+    return ""
+
+
+def _job_rows_html(jobs: list[dict], tier_color: str) -> str:
     """
-    Renders each job in the format:
-      [Company] Job Title — Time
-      ——————————————————————————
-      reason / notes
+    Renders each job as a card with three elements:
+      1. Title (linked) — company
+      2. Level tag (only if found)
+      3. Fit score + reasoning bullets (only if scored)
     """
     if not jobs:
         return '<p style="color:#888;font-size:13px;margin:4px 0 16px 0;font-style:italic;">None found this run.</p>'
 
     parts = []
     for j in jobs:
-        title   = (j.get("title") or "Untitled").replace("<", "&lt;").replace(">", "&gt;")
-        reason  = (j.get("reason") or "").replace("<", "&lt;")[:120]
-        source  = (j.get("source") or "").replace("<", "&lt;")
-        url     = j.get("url", "#")
-        t       = _fmt_time(j.get("time", ""))
-        time_str = f' - [{t}]' if t else ""
-        flagged = source in FLAGGED_COMPANIES
-
+        title    = _esc(j.get("title") or "Untitled")
+        source   = _esc(j.get("source") or "")
+        url      = _esc(j.get("url") or "#", quote=True)
+        t        = _fmt_time(j.get("time") or j.get("first_seen") or "")
+        time_str = f' <span style="color:#999;font-size:12px;">[{t}]</span>' if t else ""
         badge = (
             '<span style="background:#fef9c3;border:1px solid #d97706;color:#92400e;'
             'font-size:10px;font-weight:700;padding:1px 5px;border-radius:3px;'
             'margin-right:5px;vertical-align:middle;">★ PRIORITY</span>'
-            if flagged else ""
+            if j.get("source", "") in FLAGGED_COMPANIES else ""
         )
 
-        parts.append(
-            f'<div style="margin-bottom:14px;">'
-            f'<div style="font-size:13px;margin-bottom:3px;">'
-            f'{badge}'
-            f'<span style="color:#555;font-weight:600;">[{source}]</span> '
-            f'<a href="{url}" style="color:{link_color};font-weight:700;text-decoration:none;">{title}</a>'
-            f'<span style="color:#999;font-size:12px;">{time_str}</span>'
+        level = _level_tag(j)
+        level_html = (
+            f'<div style="margin-top:4px;">'
+            f'<span style="font-size:11px;background:#f0f0f0;padding:2px 6px;border-radius:3px;">{_esc(level)}</span>'
             f'</div>'
-            f'<div style="border-top:1px solid #e5e7eb;margin:4px 0 5px 0;"></div>'
-            f'<div style="color:#666;font-size:12px;">{reason}</div>'
+        ) if level else ""
+
+        fit_html = ""
+        if j.get("fit_score") is not None:
+            reasoning = j.get("reasoning") or []
+            if isinstance(reasoning, str):
+                reasoning = [reasoning]
+            li_items = "".join(f"<li>{_esc(str(r))}</li>" for r in reasoning)
+            fit_html = (
+                f'<div style="margin-top:6px;font-size:13px;">'
+                f'Fit: <strong>{_esc(str(j.get("fit_score")))}/100</strong>'
+                f'<ul style="margin:4px 0 0 16px;padding:0;">{li_items}</ul>'
+                f'</div>'
+            )
+
+        parts.append(
+            f'<div style="margin-bottom:16px;padding:12px;border-left:3px solid {tier_color};">'
+            f'<div>{badge}<strong><a href="{url}" style="color:#1a0dab;">{title}</a></strong> — {source}{time_str}</div>'
+            f'{level_html}'
+            f'{fit_html}'
             f'</div>'
         )
     return "\n".join(parts)
 
 
-def _accenture_alert_html(all_qualify: list[dict], all_review: list[dict]) -> str:
-    """
-    Returns the Accenture AI Native SWE alert HTML only if:
-    - A job from Accenture was found this run, OR
-    - A job with AI/AI-native/February-start signals was found anywhere.
-    Returns empty string otherwise.
-    """
-    ai_re = re.compile(
-        r'\b(ai[\s\-]?native|artificial\s+intelligence|machine\s+learning|'
-        r'february\s+start|feb(?:ruary)?\s+20\d\d|starts?\s+(?:in\s+)?february)\b',
-        re.IGNORECASE,
+def _top_picks_html(top_picks: list[dict]) -> str:
+    """Top Picks banner for the daily digest."""
+    if not top_picks:
+        return ""
+    items = ""
+    for p in top_picks:
+        title     = _esc(p.get("title") or "Untitled")
+        source    = _esc(p.get("source") or "")
+        url       = _esc(p.get("url") or "#", quote=True)
+        highlight = _esc(p.get("highlight") or "")
+        hl_html   = f'<div style="font-size:12px;color:#374151;margin-top:2px;">{highlight}</div>' if highlight else ""
+        items += (
+            f'<div style="margin-bottom:10px;">'
+            f'<strong><a href="{url}" style="color:#1a0dab;">{title}</a></strong> — {source}'
+            f'{hl_html}'
+            f'</div>'
+        )
+    return (
+        '<div style="background:#eff6ff;border:2px solid #3b82f6;border-radius:7px;'
+        'padding:12px 16px;margin-bottom:18px;font-size:13px;">'
+        '<div style="font-size:15px;font-weight:700;color:#1e3a8a;margin-bottom:8px;">⭐ Top Picks</div>'
+        f'{items}'
+        '</div>'
     )
-    for job in all_qualify + all_review:
-        src   = job.get("source", "")
-        title = job.get("title", "")
-        reason = job.get("reason", "")
-        if src == "Accenture" or ai_re.search(title) or ai_re.search(reason):
-            link = job.get("url", "https://www.accenture.com/us-en/careers/jobsearch?jk=AI+native+software+engineer&cl=us")
-            match_note = (
-                f'<a href="{link}" style="color:#0055cc;font-weight:700;">'
-                f'{"[Accenture] " + (job.get("title") or "AI Native Software Engineer") if src == "Accenture" else "Similar role found"}'
-                f'</a>'
-            )
-            return (
-                '<div style="background:#fefce8;border:2px solid #f59e0b;border-radius:7px;'
-                'padding:12px 16px;margin-bottom:18px;font-size:13px;">'
-                '<strong>⚡ Accenture AI Native SWE — FOUND:</strong> '
-                f'{match_note}'
-                '</div>'
-            )
-    return ""  # not found — no banner
 
 
 def _insights_html(source_results: list[dict], all_qualify: list[dict], all_review: list[dict]) -> str:
@@ -926,11 +1275,11 @@ def _insights_html(source_results: list[dict], all_qualify: list[dict], all_revi
 
 
 def build_html(source_results, all_qualify, all_review, total_disq,
-               run_time, is_scheduled, is_hourly, changed_sources):
+               run_time, is_scheduled, is_hourly, changed_sources,
+               all_maybe=None, top_picks=None, use_ai=False, resume_text=""):
+    all_maybe  = all_maybe or []
     accessible = sum(1 for r in source_results if r["accessible"])
     blocked    = len(source_results) - accessible
-    sg_html, _ = _sendgrid_banner()
-    accenture_html = _accenture_alert_html(all_qualify, all_review)
 
     # ── Header label ────────────────────────────────────────────────────────────
     if is_hourly:
@@ -947,10 +1296,12 @@ def build_html(source_results, all_qualify, all_review, total_disq,
         header_bg       = "#0f172a"
 
     nq  = len(all_qualify)
+    nm  = len(all_maybe)
     nr  = len(all_review)
     summary_line = (
         f'{accessible}/{len(source_results)} sources accessible &nbsp;·&nbsp; '
-        f'✅ {nq} qualifying &nbsp;·&nbsp; 🔍 {nr} review &nbsp;·&nbsp; ✗ {total_disq} disqualified'
+        f'✅ {nq} qualifying &nbsp;·&nbsp; 🟡 {nm} likely &nbsp;·&nbsp; '
+        f'🔍 {nr} review &nbsp;·&nbsp; ✗ {total_disq} disqualified'
     )
 
     # ── Blocked sources (collapsed) ──────────────────────────────────────────────
@@ -976,14 +1327,21 @@ def build_html(source_results, all_qualify, all_review, total_disq,
         f'color:#166534;margin-top:24px;">✅ Qualifying Jobs ({nq})</h2>'
         f'<p style="font-size:11px;color:#9ca3af;margin:0 0 10px 0;">'
         f'JD or title explicitly says entry level / new grad / 0–2 yr experience</p>'
-        f'{_job_rows_html(all_qualify, "#166534")}'
+        f'{_job_rows_html(all_qualify, TIER_COLORS["qualify"])}'
     )
+    maybe_section = (
+        f'<h2 style="font-size:15px;border-bottom:2px solid #b45309;padding-bottom:6px;'
+        f'color:#b45309;margin-top:24px;">🟡 Likely Qualifies ({nm})</h2>'
+        f'<p style="font-size:11px;color:#9ca3af;margin:0 0 10px 0;">'
+        f'No explicit entry-level signal, but Claude inferred you likely meet the requirements</p>'
+        f'{_job_rows_html(all_maybe, TIER_COLORS["maybe_qualify"])}'
+    ) if all_maybe else ""
     review_section = (
         f'<h2 style="font-size:15px;border-bottom:2px solid #92400e;padding-bottom:6px;'
         f'color:#92400e;margin-top:24px;">🔍 Needs Review ({nr})</h2>'
         f'<p style="font-size:11px;color:#9ca3af;margin:0 0 10px 0;">'
         f'No clear experience signal — check the JD manually</p>'
-        f'{_job_rows_html(all_review, "#92400e")}'
+        f'{_job_rows_html(all_review, TIER_COLORS["review"])}'
     )
     disq_note = (
         f'<div style="margin-top:10px;padding:7px 12px;background:#f1f5f9;'
@@ -992,20 +1350,33 @@ def build_html(source_results, all_qualify, all_review, total_disq,
         f'(title or JD says senior / 3+ years) — not shown above.</div>'
     )
 
-    # ── Profile chip ─────────────────────────────────────────────────────────────
-    profile_chip = (
-        '<div style="margin-top:20px;padding:10px 14px;background:#f0fdf4;'
-        'border:1px solid #86efac;border-radius:6px;font-size:11px;color:#166534;">'
-        '<strong>Profile:</strong> Full stack SWE · '
-        'Python, JS/TS, React, AWS, PostgreSQL · open to relocation · available immediately'
-        '</div>'
+    # ── Dynamic footer (replaces the old profile chip) ──────────────────────────
+    profile_line = (
+        f'<br>Profile: {_esc(CANDIDATE_PROFILE)}' if CANDIDATE_PROFILE else ""
     )
+    if use_ai and resume_text:
+        n_scored  = sum(1 for j in (all_qualify + all_maybe + all_review) if j.get("fit_score") is not None)
+        model_lbl = HAIKU_MODEL + (f' · Top picks: {SONNET_MODEL}' if is_scheduled else '')
+        footer_html = (
+            f'<p style="font-size:11px;color:#888;margin-top:24px;'
+            f'border-top:1px solid #eee;padding-top:8px;">'
+            f'Fit scoring: {model_lbl} · {n_scored} jobs ranked · Skills profile loaded ✓'
+            f'{profile_line}</p>'
+        )
+    else:
+        footer_html = (
+            '<p style="font-size:11px;color:#aaa;margin-top:24px;'
+            'border-top:1px solid #eee;padding-top:8px;">'
+            'AI scoring: not enabled — run with --use-ai to score'
+            f'{profile_line}</p>'
+        )
 
     # ── Digest-only extras ───────────────────────────────────────────────────────
     insights_section = (
-        _insights_html(source_results, all_qualify, all_review)
+        _insights_html(source_results, all_qualify, all_maybe + all_review)
         if is_scheduled else ""
     )
+    top_picks_section = _top_picks_html(top_picks or []) if is_scheduled else ""
 
     footer = (
         '<p style="font-size:11px;color:#9ca3af;margin-top:20px;text-align:center;">'
@@ -1018,14 +1389,15 @@ def build_html(source_results, all_qualify, all_review, total_disq,
     newsletter_intro = ""
     if is_scheduled:
         nq_phrase  = f"<strong>{nq} qualifying role{'s' if nq != 1 else ''}</strong>" if nq else "no qualifying roles"
+        nm_phrase  = f"<strong>{nm} likely qualifying</strong>, " if nm else ""
         nr_phrase  = f"<strong>{nr} to review</strong>" if nr else "nothing flagged for review"
         newsletter_intro = (
             f'<div style="border-left:4px solid #0f172a;padding:12px 16px;'
             f'background:#f9fafb;margin-bottom:20px;border-radius:0 6px 6px 0;">'
             f'<p style="margin:0;font-size:14px;color:#374151;line-height:1.6;">'
-            f"Today's scan turned up {nq_phrase} and {nr_phrase} across "
+            f"Today's scan turned up {nq_phrase}, {nm_phrase}and {nr_phrase} across "
             f'<strong>{accessible}</strong> accessible sources. '
-            f'Flagged companies appear first in each section below.</p>'
+            f'Each section is sorted by fit score, then flagged companies, then recency.</p>'
             f'</div>'
         )
 
@@ -1041,22 +1413,23 @@ def build_html(source_results, all_qualify, all_review, total_disq,
   <p style="margin:6px 0 0;opacity:0.65;font-size:12px;">{run_time} &nbsp;·&nbsp; {summary_line}</p>
 </div>
 
-{sg_html}
+{top_picks_section}
 {newsletter_intro}
-{accenture_html}
 {qualify_section}
+{maybe_section}
 {review_section}
 {disq_note}
 {blocked_section}
-{profile_chip}
 {insights_section}
 {footer}
+{footer_html}
 </body></html>"""
 
 
 def build_text(source_results, all_qualify, all_review, total_disq,
-               run_time, is_scheduled, is_hourly, changed_sources):
-    _, sg_text = _sendgrid_banner()
+               run_time, is_scheduled, is_hourly, changed_sources,
+               all_maybe=None):
+    all_maybe  = all_maybe or []
     accessible = sum(1 for r in source_results if r["accessible"])
 
     if is_hourly:
@@ -1077,61 +1450,39 @@ def build_text(source_results, all_qualify, all_review, total_disq,
     lines += [
         f"Run: {run_time}",
         f"{accessible}/{len(source_results)} sources accessible · "
-        f"✅ {len(all_qualify)} qualifying · 🔍 {len(all_review)} review · ✗ {total_disq} disqualified",
+        f"✅ {len(all_qualify)} qualifying · 🟡 {len(all_maybe)} likely · "
+        f"🔍 {len(all_review)} review · ✗ {total_disq} disqualified",
         "=" * 60,
         "",
     ]
 
-    if sg_text:
-        lines += [sg_text, ""]
-
-    # Accenture alert only if found
-    ai_re = re.compile(
-        r'\b(ai[\s\-]?native|artificial\s+intelligence|machine\s+learning|'
-        r'february\s+start|feb(?:ruary)?\s+20\d\d|starts?\s+(?:in\s+)?february)\b',
-        re.IGNORECASE,
-    )
-    for job in all_qualify + all_review:
-        src = job.get("source", "")
-        if src == "Accenture" or ai_re.search(job.get("title", "")) or ai_re.search(job.get("reason", "")):
-            lines += [
-                "⚡ ACCENTURE AI NATIVE SWE FOUND:",
-                f"   {job.get('title', 'Role found')} — {job.get('url', '')}",
-                "",
+    def _text_rows(jobs: list[dict]) -> list[str]:
+        if not jobs:
+            return ["  None found this run.", ""]
+        out = []
+        for j in jobs:
+            t = _fmt_time(j.get("time") or j.get("first_seen") or "")
+            time_str = f" - [{t}]" if t else ""
+            priority = "★ PRIORITY  " if j.get("source", "") in FLAGGED_COMPANIES else ""
+            out += [
+                f"  {priority}[{j.get('source', '')}] {j.get('title') or 'Untitled'}{time_str}",
+                f"  ——",
+                f"  {j.get('reason', '')}",
             ]
-            break
+            if j.get("fit_score") is not None:
+                out.append(f"  Fit: {j.get('fit_score')}/100")
+            out += [f"  {j.get('url', '')}", ""]
+        return out
 
     lines += ["✅ QUALIFYING JOBS", "-" * 40]
-    if all_qualify:
-        for j in all_qualify:
-            t = _fmt_time(j.get("time", ""))
-            time_str = f" - [{t}]" if t else ""
-            priority = "★ PRIORITY  " if j.get("source", "") in FLAGGED_COMPANIES else ""
-            lines += [
-                f"  {priority}[{j.get('source', '')}] {j.get('title', 'Untitled')}{time_str}",
-                f"  ——",
-                f"  {j.get('reason', '')}",
-                f"  {j.get('url', '')}",
-                "",
-            ]
-    else:
-        lines += ["  None found this run.", ""]
+    lines += _text_rows(all_qualify)
+
+    if all_maybe:
+        lines += ["🟡 LIKELY QUALIFIES", "-" * 40]
+        lines += _text_rows(all_maybe)
 
     lines += ["🔍 NEEDS REVIEW", "-" * 40]
-    if all_review:
-        for j in all_review:
-            t = _fmt_time(j.get("time", ""))
-            time_str = f" - [{t}]" if t else ""
-            priority = "★ PRIORITY  " if j.get("source", "") in FLAGGED_COMPANIES else ""
-            lines += [
-                f"  {priority}[{j.get('source', '')}] {j.get('title', 'Untitled')}{time_str}",
-                f"  ——",
-                f"  {j.get('reason', '')}",
-                f"  {j.get('url', '')}",
-                "",
-            ]
-    else:
-        lines += ["  None found this run.", ""]
+    lines += _text_rows(all_review)
 
     lines += [
         f"✗ {total_disq} disqualified (senior / 3+ years) — not shown.",
@@ -1148,7 +1499,7 @@ def build_text(source_results, all_qualify, all_review, total_disq,
             "Full Stack", "Backend", "Frontend", "Mobile", "Data", "Cloud",
         ]
         keyword_counts: dict[str, int] = {}
-        for j in all_qualify + all_review:
+        for j in all_qualify + all_maybe + all_review:
             combined = f"{j.get('title','')} {j.get('reason','')}".lower()
             for kw in TECH_STACK_KEYWORDS:
                 if kw.lower() in combined:
@@ -1182,69 +1533,31 @@ def build_text(source_results, all_qualify, all_review, total_disq,
 
 
 # ── Send email ───────────────────────────────────────────────────────────────────
-def _sendgrid(subject, html, text, to):
-    key = os.environ.get("SENDGRID_API_KEY", "")
-    if not key:
-        return False, "SENDGRID_API_KEY not set"
-    payload = json.dumps({
-        "personalizations": [{"to": [{"email": to}]}],
-        "from": {"email": "jobmonitor@jobnotify.dev", "name": "Job Monitor"},
-        "subject": subject,
-        "content": [
-            {"type": "text/plain", "value": text},
-            {"type": "text/html",  "value": html},
-        ],
-    }).encode()
-    req = Request(
-        "https://api.sendgrid.com/v3/mail/send",
-        data=payload,
-        headers={
-            "Authorization": f"Bearer {key}",
-            "Content-Type": "application/json",
-        },
-        method="POST",
-    )
+def send_email(subject: str, html_body: str, text_body: str = ""):
+    """Send email via Gmail SMTP. Returns True on success, False otherwise."""
+    if not NOTIFY_EMAIL or not SMTP_USER or not SMTP_PASS:
+        print(f"  Email skipped (SMTP credentials not set): {subject}")
+        return False
     try:
-        ctx = ssl.create_default_context()
-        with urlopen(req, timeout=30, context=ctx) as r:
-            return True, f"SendGrid OK {r.status}"
-    except HTTPError as e:
-        return False, f"SendGrid HTTP {e.code}: {e.read().decode()[:200]}"
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = subject
+        msg["From"]    = f"Job Monitor <{SMTP_USER}>"
+        msg["To"]      = NOTIFY_EMAIL
+        if text_body:
+            msg.attach(MIMEText(text_body, "plain"))
+        msg.attach(MIMEText(html_body, "html"))
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+            server.login(SMTP_USER, SMTP_PASS)
+            server.sendmail(SMTP_USER, NOTIFY_EMAIL, msg.as_string())
+        print(f"  Email sent: {subject}")
+        return True
     except Exception as e:
-        return False, f"SendGrid: {e}"
-
-
-def _smtp(subject, html, text, to):
-    user = os.environ.get("SMTP_USER", "")
-    pw   = os.environ.get("SMTP_PASS", "")
-    if not user or not pw:
-        return False, "SMTP_USER / SMTP_PASS not set"
-    msg = MIMEMultipart("alternative")
-    msg["Subject"] = subject
-    msg["From"]    = user
-    msg["To"]      = to
-    msg.attach(MIMEText(text, "plain"))
-    msg.attach(MIMEText(html, "html"))
-    try:
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
-            s.login(user, pw)
-            s.sendmail(user, to, msg.as_string())
-        return True, "SMTP OK"
-    except Exception as e:
-        return False, f"SMTP: {e}"
-
-
-def send_email(subject, html, text, to):
-    if os.environ.get("SENDGRID_API_KEY"):
-        ok, msg = _sendgrid(subject, html, text, to)
-        if ok:
-            return True, msg
-        print(f"  SendGrid failed ({msg}) — trying SMTP")
-    return _smtp(subject, html, text, to)
+        print(f"  Email failed ({type(e).__name__}): {e}")
+        return False
 
 
 # ── Entry point ──────────────────────────────────────────────────────────────────
-async def run_async(is_scheduled: bool, is_hourly: bool):
+async def run_async(is_scheduled: bool, is_hourly: bool, use_ai: bool = False):
     if not NOTIFY_EMAIL:
         print("ERROR: NOTIFY_EMAIL environment variable is not set.")
         sys.exit(1)
@@ -1253,8 +1566,11 @@ async def run_async(is_scheduled: bool, is_hourly: bool):
     run_time = now_cst.strftime("%B %-d, %Y %-I:%M %p CST")
     mode     = "scheduled" if is_scheduled else ("hourly" if is_hourly else "on-demand")
     max_jobs = MAX_JOBS_HOURLY if is_hourly else MAX_JOBS_DAILY
+    ai_on    = is_scheduled or use_ai
+    model    = HAIKU_MODEL   # all per-job scoring; Sonnet is used once, for Top Picks
 
-    print(f"[{run_time}] Job Monitor v2 | mode={mode} | playwright={HAS_PLAYWRIGHT} | bs4={HAS_BS4}")
+    print(f"[{run_time}] Job Monitor v2 | mode={mode} | ai={ai_on} | "
+          f"playwright={HAS_PLAYWRIGHT} | bs4={HAS_BS4}")
 
     quiet = 0 <= now_cst.hour < 7
     if quiet:
@@ -1276,27 +1592,82 @@ async def run_async(is_scheduled: bool, is_hourly: bool):
             await asyncio.sleep(0.3)
 
     # Aggregate across all sources
-    all_qualify  = []
-    all_review   = []
     total_disq   = 0
     changed_srcs = [r["name"] for r in source_results if r.get("page_changed")]
     accessible   = sum(1 for r in source_results if r["accessible"])
-
     for r in source_results:
-        for j in r["jobs_qualify"]:
-            all_qualify.append({**j, "source": r["name"], "source_url": r["url"]})
-        for j in r["jobs_review"]:
-            all_review.append({**j, "source": r["name"], "source_url": r["url"]})
         total_disq += r.get("jobs_disqualify_count", 0)
 
-    # Flagged companies always appear first in results
-    def _flagged_first(job: dict) -> int:
-        return 0 if job.get("source", "") in FLAGGED_COMPANIES else 1
-    all_qualify.sort(key=_flagged_first)
-    all_review.sort(key=_flagged_first)
+    if is_scheduled:
+        # Daily digest: every non-disqualified job not yet included in a digest
+        # (covers everything the hourly runs found since the last digest).
+        undigested = [
+            {**v, "url": k}
+            for k, v in state.get("seen_job_urls", {}).items()
+            if not v.get("in_digest", False) and v.get("verdict") != "disqualify"
+        ]
+        all_jobs = undigested
+    else:
+        # Hourly / on-demand: only jobs found this run
+        seen_urls = state.get("seen_job_urls", {})
+        all_jobs  = []
+        for r in source_results:
+            for j in r["jobs_qualify"] + r["jobs_review"]:
+                st = seen_urls.get(j.get("url"), {})
+                all_jobs.append({
+                    **j,
+                    "source":     r["name"],
+                    "source_url": r["url"],
+                    "verdict":    st.get("verdict", "review"),
+                    "first_seen": st.get("first_seen", j.get("time")),
+                    "jd_text":       st.get("jd_text"),
+                    "fit_score":     st.get("fit_score"),
+                    "reasoning":     st.get("reasoning", []),
+                    "maybe_qualify": st.get("maybe_qualify"),
+                })
+
+    # AI fit scoring (skipped in quiet hours: no email goes out, and the jobs
+    # stay unscored in state so the next run that does send scores them)
+    AI_USAGE.clear()
+    resume_text = load_resume() if ai_on else ""
+    if ai_on and all_jobs and not quiet:
+        all_jobs = await score_jobs_parallel(all_jobs, resume_text, model)
+        # Persist scores now so no later run (hourly or digest) pays for them again,
+        # even if this run's email fails.
+        seen_urls = state.get("seen_job_urls", {})
+        for job in all_jobs:
+            url = job.get("url")
+            if job.get("fit_score") is not None and url in seen_urls:
+                seen_urls[url]["fit_score"]     = job["fit_score"]
+                seen_urls[url]["reasoning"]     = job.get("reasoning", [])
+                seen_urls[url]["maybe_qualify"] = job.get("maybe_qualify")
+
+    # Upgrade review jobs where Claude inferred the candidate likely qualifies
+    for job in all_jobs:
+        if job.get("verdict") == "review" and job.get("maybe_qualify"):
+            job["verdict"] = "maybe_qualify"
+
+    all_qualify = [j for j in all_jobs if j.get("verdict") == "qualify"]
+    all_maybe   = [j for j in all_jobs if j.get("verdict") == "maybe_qualify"]
+    all_review  = [j for j in all_jobs if j.get("verdict") == "review"]
+
+    # Sort: fit score (high → low) → flagged companies → recency (newest first)
+    def _sort_key(job: dict) -> tuple:
+        score   = -(job.get("fit_score") or 0)       # higher score → smaller value → first
+        flagged = 0 if job.get("source", "") in FLAGGED_COMPANIES else 1
+        try:
+            from datetime import datetime as _dt
+            ts = -_dt.fromisoformat(job.get("first_seen", "1970-01-01T00:00:00")).timestamp()
+        except Exception:
+            ts = 0.0
+        return (score, flagged, ts)
+
+    all_qualify.sort(key=_sort_key)
+    all_maybe.sort(key=_sort_key)
+    all_review.sort(key=_sort_key)
 
     print(
-        f"\n  Results: ✅ {len(all_qualify)} qualifying | "
+        f"\n  Results: ✅ {len(all_qualify)} qualifying | 🟡 {len(all_maybe)} likely | "
         f"🔍 {len(all_review)} review | ✗ {total_disq} disqualified | "
         f"{accessible}/{len(source_results)} sources accessible"
     )
@@ -1308,7 +1679,7 @@ async def run_async(is_scheduled: bool, is_hourly: bool):
     if quiet:
         skip_reason = f"quiet hours ({now_cst.strftime('%H:%M')} CST)"
     elif is_hourly:
-        if all_qualify or all_review:
+        if all_qualify or all_maybe or all_review:
             should_send = True
         else:
             skip_reason = "hourly run — no new qualifying/review jobs found"
@@ -1318,22 +1689,50 @@ async def run_async(is_scheduled: bool, is_hourly: bool):
     if skip_reason:
         print(f"  ⏸  Email skipped: {skip_reason}")
     elif should_send:
+        # Top picks banner — daily digest only
+        top_picks = []
+        if is_scheduled and ai_on:
+            top_picks = await get_top_picks(sorted(all_qualify + all_maybe, key=_sort_key), resume_text)
+
+        n_good   = len(all_qualify) + len(all_maybe)
         subj_tag = "12pm Digest" if is_scheduled else (
-            f"{len(all_qualify)} qualifying job{'s' if len(all_qualify) != 1 else ''}"
-            if all_qualify else "job alert"
+            f"{n_good} qualifying job{'s' if n_good != 1 else ''}"
+            if n_good else "job alert"
         )
         subject = f"[Job Monitor] {subj_tag} — {run_time}"
         html = build_html(source_results, all_qualify, all_review, total_disq,
-                          run_time, is_scheduled, is_hourly, changed_srcs)
+                          run_time, is_scheduled, is_hourly, changed_srcs,
+                          all_maybe=all_maybe, top_picks=top_picks,
+                          use_ai=ai_on, resume_text=resume_text)
         text = build_text(source_results, all_qualify, all_review, total_disq,
-                          run_time, is_scheduled, is_hourly, changed_srcs)
-        ok, msg = send_email(subject, html, text, NOTIFY_EMAIL)
-        print(f"  {'✅' if ok else '❌'} Email ({subj_tag}): {msg}")
+                          run_time, is_scheduled, is_hourly, changed_srcs,
+                          all_maybe=all_maybe)
+        ok = send_email(subject, html, text)
         if not ok:
             print("\n--- PLAIN TEXT REPORT (email failed) ---")
             print(text[:3000])
         state["last_email_status"] = "ok" if ok else "failed"
         state["last_email_time"]   = run_time
+
+        # Mark digested jobs only once the digest actually went out, so a failed
+        # send doesn't silently drop them from tomorrow's digest.
+        if is_scheduled and ok:
+            for job in all_qualify + all_maybe + all_review:
+                url = job.get("url")
+                if url and url in state.get("seen_job_urls", {}):
+                    state["seen_job_urls"][url]["in_digest"]  = True
+                    state["seen_job_urls"][url]["fit_score"]  = job.get("fit_score")
+                    state["seen_job_urls"][url]["reasoning"]  = job.get("reasoning", [])
+                    state["seen_job_urls"][url]["jd_text"]    = None   # cleared to save space
+
+    if AI_USAGE:
+        for m, u in AI_USAGE.items():
+            print(f"  AI usage [{m}]: {u['requests']} req · in {u['input_tokens']} · "
+                  f"cache write {u['cache_creation_input_tokens']} · "
+                  f"cache read {u['cache_read_input_tokens']} · out {u['output_tokens']}")
+        log = state.setdefault("ai_usage_log", [])
+        log.append({"run": run_time, "mode": mode, "usage": {m: dict(u) for m, u in AI_USAGE.items()}})
+        state["ai_usage_log"] = log[-90:]
 
     state["last_run"]             = run_time
     state["last_changed_sources"] = changed_srcs
@@ -1341,11 +1740,12 @@ async def run_async(is_scheduled: bool, is_hourly: bool):
     print("Done.")
 
 
-def run(is_scheduled=False, is_hourly=False):
-    asyncio.run(run_async(is_scheduled, is_hourly))
+def run(is_scheduled=False, is_hourly=False, use_ai: bool = False):
+    asyncio.run(run_async(is_scheduled, is_hourly, use_ai=use_ai))
 
 
 if __name__ == "__main__":
     is_scheduled = "--scheduled" in sys.argv
     is_hourly    = "--hourly"    in sys.argv
-    run(is_scheduled=is_scheduled, is_hourly=is_hourly)
+    use_ai       = "--use-ai"    in sys.argv
+    run(is_scheduled=is_scheduled, is_hourly=is_hourly, use_ai=use_ai)

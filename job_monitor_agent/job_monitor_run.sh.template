@@ -1,0 +1,22 @@
+#!/bin/bash
+# Copy this to job_monitor_run.sh and fill in your credentials.
+# job_monitor_run.sh is gitignored — never commit it.
+
+export NOTIFY_EMAIL="your@email.com"
+export SMTP_USER="your@gmail.com"
+export SMTP_PASS="your-app-password"
+export ANTHROPIC_API_KEY="sk-ant-..."
+export CANDIDATE_PROFILE=""   # optional: one-line profile for the email footer
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# Resolve python3: project venv first (has bs4 + pdfplumber), then Homebrew, then system.
+# Create the venv once with:
+#   python3 -m venv .venv && .venv/bin/pip install beautifulsoup4 pdfplumber
+if   [ -x "$SCRIPT_DIR/.venv/bin/python3" ];        then PY="$SCRIPT_DIR/.venv/bin/python3"
+elif command -v /opt/homebrew/bin/python3 &>/dev/null; then PY=/opt/homebrew/bin/python3
+elif command -v /usr/local/bin/python3    &>/dev/null; then PY=/usr/local/bin/python3
+else                                                        PY=/usr/bin/python3
+fi
+
+exec "$PY" -I "$SCRIPT_DIR/job_monitor.py" "$@"

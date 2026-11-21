@@ -5,85 +5,183 @@ on:
     workflows: ["Job Monitor"]
     types: [completed]
 
-# Needs write access to commit the fix back
-permissions:
-  contents: write
+# Nothing by default; each job asks for only what it needs.
+permissions: {}
 
 jobs:
   fix:
     if: ${{ github.event.workflow_run.conclusion == 'failure' }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: write        # push the auto-fix branch
+      pull-requests: write   # open the PR
+      actions: read          # read the failed run's logs
+    outputs:
+      pr_number: ${{ steps.pr.outputs.pr_number }}
+      branch:    ${{ steps.pr.outputs.branch }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # The monitor runs hourly, so a bug would otherwise open a new PR every hour
+      # until the first one is merged.
+      - name: Skip if an auto-fix PR is already open
+        id: guard
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          OPEN=$(gh pr list --state open --json headRefName \
+                 --jq '[.[] | select(.headRefName | startswith("auto-fix/"))] | length')
+          echo "open_autofix_prs=$OPEN" >> "$GITHUB_OUTPUT"
+          if [ "$OPEN" != "0" ]; then
+            echo "An auto-fix PR is already open — skipping this run."
+          fi
+
       - name: Set up Python
+        if: steps.guard.outputs.open_autofix_prs == '0'
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
       - name: Get error logs from failed run
+        if: steps.guard.outputs.open_autofix_prs == '0'
         env:
           GH_TOKEN: ${{ github.token }}
+          RUN_ID:   ${{ github.event.workflow_run.id }}
         run: |
-          gh run view ${{ github.event.workflow_run.id }} --log-failed > error_log.txt 2>&1 || true
+          gh run view "$RUN_ID" --log-failed > job_monitor_agent/error_log.txt 2>&1 || true
           echo "=== Last 60 lines of error log ==="
-          tail -60 error_log.txt
+          tail -60 job_monitor_agent/error_log.txt
 
       - name: Run auto-fix
         id: autofix
+        if: steps.guard.outputs.open_autofix_prs == '0'
+        working-directory: job_monitor_agent
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          SENDGRID_API_KEY:  ${{ secrets.SENDGRID_API_KEY }}
+          SMTP_USER:         ${{ secrets.SMTP_USER }}
+          SMTP_PASS:         ${{ secrets.SMTP_PASS }}
           NOTIFY_EMAIL:      ${{ secrets.NOTIFY_EMAIL }}
           FAILED_RUN_URL:    ${{ github.event.workflow_run.html_url }}
           FAILED_RUN_NUMBER: ${{ github.event.workflow_run.run_number }}
         run: python3 auto_fix_runner.py
 
-      - name: Commit and push fix
-        if: steps.autofix.outputs.fix_applied == 'true'
-        run: |
-          git config user.email "auto-fix[bot]@users.noreply.github.com"
-          git config user.name "auto-fix[bot]"
-          git add job_monitor.py
-          git commit -m "auto-fix: repair after failed run #${{ github.event.workflow_run.run_number }}"
-          git push
-
-      - name: Send success notification
+      - name: Push branch and open PR
+        id: pr
         if: steps.autofix.outputs.fix_applied == 'true'
         env:
-          SENDGRID_API_KEY:  ${{ secrets.SENDGRID_API_KEY }}
-          NOTIFY_EMAIL:      ${{ secrets.NOTIFY_EMAIL }}
+          GH_TOKEN:          ${{ github.token }}
           FAILED_RUN_URL:    ${{ github.event.workflow_run.html_url }}
           FAILED_RUN_NUMBER: ${{ github.event.workflow_run.run_number }}
         run: |
+          BRANCH="auto-fix/run-${FAILED_RUN_NUMBER}"
+          git config user.email "auto-fix[bot]@users.noreply.github.com"
+          git config user.name "auto-fix[bot]"
+          git switch -c "$BRANCH"
+          git add job_monitor_agent/job_monitor.py
+          git commit -m "auto-fix: repair after failed run #${FAILED_RUN_NUMBER}"
+          git push origin "$BRANCH"
+          BODY="$RUNNER_TEMP/pr_body.md"
+          {
+            echo "Claude generated this patch after [run #${FAILED_RUN_NUMBER}](${FAILED_RUN_URL}) failed."
+            echo
+            echo "### Claude's summary of the fix"
+            cat job_monitor_agent/fix_summary.md 2>/dev/null || echo "_(no summary)_"
+            echo
+            echo "A Claude Code review will be posted as a comment. **Nothing is merged automatically** — review the diff and merge (or close) it yourself."
+          } > "$BODY"
+          PR_URL=$(gh pr create \
+            --base main --head "$BRANCH" \
+            --title "auto-fix: repair after failed run #${FAILED_RUN_NUMBER}" \
+            --body-file "$BODY")
+          echo "pr_url=$PR_URL"                  >> "$GITHUB_OUTPUT"
+          echo "pr_number=${PR_URL##*/}"         >> "$GITHUB_OUTPUT"
+          echo "branch=$BRANCH"                  >> "$GITHUB_OUTPUT"
+
+      - name: Send PR notification
+        if: steps.pr.outputs.pr_url != ''
+        env:
+          SMTP_USER:         ${{ secrets.SMTP_USER }}
+          SMTP_PASS:         ${{ secrets.SMTP_PASS }}
+          NOTIFY_EMAIL:      ${{ secrets.NOTIFY_EMAIL }}
+          FAILED_RUN_URL:    ${{ github.event.workflow_run.html_url }}
+          FAILED_RUN_NUMBER: ${{ github.event.workflow_run.run_number }}
+          PR_URL:            ${{ steps.pr.outputs.pr_url }}
+        run: |
           python3 -c "
-          import os, json, ssl
-          from urllib.request import Request, urlopen
-          key     = os.environ['SENDGRID_API_KEY']
-          to      = os.environ['NOTIFY_EMAIL']
-          run_url = os.environ['FAILED_RUN_URL']
-          run_num = os.environ['FAILED_RUN_NUMBER']
+          import os, smtplib
+          from email.mime.text import MIMEText
+          smtp_user  = os.environ['SMTP_USER']
+          smtp_pass  = os.environ['SMTP_PASS']
+          to         = os.environ['NOTIFY_EMAIL']
+          run_url    = os.environ['FAILED_RUN_URL']
+          run_num    = os.environ['FAILED_RUN_NUMBER']
+          pr_url     = os.environ['PR_URL']
           body = (
-              f'Job monitor run #{run_num} failed, but a bug fix was automatically generated '
-              f'by Claude and committed to the repo. The monitor will resume on its next '
-              f'scheduled run.\n\n'
+              f'Job monitor run #{run_num} failed. Claude generated a fix and opened a '
+              f'pull request; a Claude Code review will be posted on it shortly.\n\n'
+              f'Review and merge: {pr_url}\n'
               f'Failed run: {run_url}\n\n'
-              f'No action needed unless the auto-fix run also fails.'
+              f'The monitor keeps failing until the PR is merged.'
           )
-          payload = json.dumps({
-              'personalizations': [{'to': [{'email': to}]}],
-              'from': {'email': 'jobmonitor@jobnotify.dev', 'name': 'Job Monitor'},
-              'subject': f'[Job Monitor] Bug auto-fixed (run #{run_num})',
-              'content': [{'type': 'text/plain', 'value': body}],
-          }).encode()
-          req = Request(
-              'https://api.sendgrid.com/v3/mail/send',
-              data=payload,
-              headers={'Authorization': f'Bearer {key}', 'Content-Type': 'application/json'},
-              method='POST',
-          )
-          with urlopen(req, timeout=30, context=ssl.create_default_context()) as r:
-              print(f'Notification sent ({r.status})')
+          msg = MIMEText(body, 'plain')
+          msg['Subject'] = f'[Job Monitor] Auto-fix PR ready for review (run #{run_num})'
+          msg['From']    = f'Job Monitor <{smtp_user}>'
+          msg['To']      = to
+          with smtplib.SMTP_SSL('smtp.gmail.com', 465) as s:
+              s.login(smtp_user, smtp_pass)
+              s.sendmail(smtp_user, to, msg.as_string())
+          print('Notification sent')
           "
+
+  # A PR opened with GITHUB_TOKEN does not trigger other workflows (GitHub's
+  # loop protection), so the review runs here rather than on `pull_request`.
+  review:
+    needs: fix
+    if: ${{ needs.fix.outputs.pr_number != '' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write   # lets the built-in token post review comments
+    steps:
+      - name: Checkout PR branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.fix.outputs.branch }}
+          fetch-depth: 1
+
+      - name: Claude Code review
+        uses: anthropics/claude-code-action@cb5e706113afc5dc4f36cdcf5d784ca88f351823 # v1.0.286
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          # Built-in per-run token instead of the Claude GitHub App: nothing to install,
+          # scoped to this job's permissions above, expires when the job ends.
+          # Comments post as github-actions[bot].
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          # The PR is opened by the workflow's own token, so its author is
+          # github-actions[bot]. Allow only that bot (not '*').
+          allowed_bots: 'github-actions[bot]'
+          prompt: |
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ needs.fix.outputs.pr_number }}
+            FAILED RUN: ${{ github.event.workflow_run.html_url }}
+
+            This PR was generated automatically by an LLM to fix a failed run of
+            job_monitor_agent/job_monitor.py. Treat it as untrusted code. Review it for:
+            - Does the change plausibly fix the failure, and is it minimal and targeted?
+            - Was any unrelated functionality removed or rewritten (sources, classification,
+              email, AI scoring, state handling)?
+            - Security: new network destinations, reading or sending environment variables /
+              secrets, shell execution, eval/exec, or anything that looks injected.
+            - Python errors the diff introduces.
+
+            The PR branch is already checked out. Use `gh pr diff` to read the change.
+            End with a one-line verdict: SAFE TO MERGE, NEEDS CHANGES, or DO NOT MERGE.
+            Use `gh pr comment` for the summary and
+            `mcp__github_inline_comment__create_inline_comment` (with `confirmed: true`)
+            for specific lines. Only post GitHub comments.
+          claude_args: |
+            --model claude-opus-5-5
+            --max-turns 15
+            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"

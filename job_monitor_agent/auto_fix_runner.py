@@ -4,11 +4,11 @@ auto_fix_runner.py — called by GitHub Actions when job_monitor fails.
 
 Steps:
   1. Read error_log.txt written by the workflow
-  2. Call Claude API to generate a targeted fix
-  3. Validate the fix (syntax check + basic sanity)
+  2. Call Claude API for a targeted fix as exact search/replace edits
+  3. Apply the edits, then validate (syntax check + basic sanity)
   4. Write the fixed job_monitor.py
-  5. Write fix_applied=true to GITHUB_OUTPUT so the workflow commits it
-  6. Send an email via SendGrid in all cases (fixed / could not fix)
+  5. Write fix_applied=true to GITHUB_OUTPUT so the workflow opens a PR for review
+  6. Send an email via Gmail SMTP in all cases (fixed / could not fix)
 """
 
 import ast
@@ -21,15 +21,16 @@ from urllib.request import Request, urlopen
 
 # ── Config ───────────────────────────────────────────────────────────────────
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-SENDGRID_API_KEY  = os.environ.get("SENDGRID_API_KEY", "")
+SMTP_USER = os.environ.get("SMTP_USER", "")
+SMTP_PASS = os.environ.get("SMTP_PASS", "")
 NOTIFY_EMAIL      = os.environ.get("NOTIFY_EMAIL", "")
 FAILED_RUN_URL    = os.environ.get("FAILED_RUN_URL", "")
 FAILED_RUN_NUMBER = os.environ.get("FAILED_RUN_NUMBER", "?")
 GITHUB_OUTPUT     = os.environ.get("GITHUB_OUTPUT", "")
 
-FROM_EMAIL = "jobmonitor@jobnotify.dev"
 SCRIPT_FILE = "job_monitor.py"
 LOG_FILE    = "error_log.txt"
+SUMMARY_FILE = "fix_summary.md"   # read by the workflow for the PR body
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -42,24 +43,55 @@ def read_error_log() -> str:
         return "(error_log.txt not found)"
 
 
-def call_claude(error_log: str, script: str) -> tuple[str | None, str | None]:
-    """Call Anthropic API; return (fixed_script, error_message)."""
+# Structured output: a short summary plus exact search/replace edits. Returning
+# edits instead of the whole ~1,500-line script keeps the reply to a few hundred
+# tokens (the full script would not fit in max_tokens and would be cut off).
+EDITS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "summary": {"type": "string"},
+        "edits": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "old": {"type": "string"},
+                    "new": {"type": "string"},
+                },
+                "required": ["old", "new"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["summary", "edits"],
+    "additionalProperties": False,
+}
+MAX_EDITS = 10
+
+
+def call_claude(error_log: str, script: str) -> tuple[dict | None, str | None]:
+    """Call Anthropic API; return ({summary, edits}, error_message)."""
     if not ANTHROPIC_API_KEY:
         return None, "ANTHROPIC_API_KEY secret not set — add it in repo Settings → Secrets"
 
     prompt = (
         "You are maintaining a Python job-monitoring script that runs on GitHub Actions.\n"
-        "It just failed with the error log below. Fix ONLY the specific bug causing the failure.\n"
-        "Return the COMPLETE corrected Python script and absolutely nothing else — "
-        "no explanation, no markdown code fences, just the raw Python code.\n\n"
+        "It just failed with the error log below. Fix ONLY the specific bug causing the failure.\n\n"
+        "Return the fix as search/replace edits:\n"
+        "- `old` must be copied character-for-character from the current script (including "
+        "indentation) and must appear exactly once — include surrounding lines if needed to make it unique.\n"
+        "- `new` is the replacement text.\n"
+        f"- Use as few edits as possible (at most {MAX_EDITS}). Do not refactor or reformat.\n"
+        "- `summary`: 2-4 sentences on the root cause and what the edits change.\n\n"
         f"ERROR LOG:\n{error_log}\n\n"
         f"CURRENT SCRIPT:\n{script}"
     )
 
     payload = json.dumps({
-        "model": "claude-3-5-haiku-20241022",
+        "model": "claude-haiku-5-5",
         "max_tokens": 8192,
         "messages": [{"role": "user", "content": prompt}],
+        "output_config": {"format": {"type": "json_schema", "schema": EDITS_SCHEMA}},
     }).encode()
 
     req = Request(
@@ -74,22 +106,44 @@ def call_claude(error_log: str, script: str) -> tuple[str | None, str | None]:
     )
     ctx = ssl.create_default_context()
     try:
-        with urlopen(req, timeout=120, context=ctx) as r:
+        with urlopen(req, timeout=180, context=ctx) as r:
             resp = json.loads(r.read())
-        fixed = resp["content"][0]["text"].strip()
-
-        # Strip markdown fences if the model added them despite instructions
-        if fixed.startswith("```"):
-            lines = fixed.split("\n")
-            end   = -1 if lines[-1].strip().startswith("```") else len(lines)
-            fixed = "\n".join(lines[1:end])
-
-        return fixed, None
+        stop = resp.get("stop_reason")
+        if stop == "refusal":
+            return None, "Claude declined to generate a fix (stop_reason=refusal)"
+        if stop == "max_tokens":
+            return None, "Claude's edits were cut off at max_tokens"
+        # Current models think by default: content[0] is usually a thinking block,
+        # so take the first text block.
+        text = next((b.get("text", "") for b in resp.get("content", [])
+                     if b.get("type") == "text"), "").strip()
+        if not text:
+            return None, "Claude returned no text block"
+        usage = resp.get("usage") or {}
+        print(f"  Tokens: in {usage.get('input_tokens')} · out {usage.get('output_tokens')}")
+        return json.loads(text), None
 
     except HTTPError as e:
         return None, f"Anthropic API HTTP {e.code}: {e.read().decode()[:300]}"
     except Exception as e:
         return None, f"{type(e).__name__}: {str(e)[:200]}"
+
+
+def apply_edits(script: str, edits: list[dict]) -> tuple[str | None, str | None]:
+    """Apply exact search/replace edits. Every `old` must match exactly once."""
+    if not edits:
+        return None, "Claude proposed no edits"
+    if len(edits) > MAX_EDITS:
+        return None, f"Claude proposed {len(edits)} edits (max {MAX_EDITS}) — fix looks too aggressive"
+    for i, e in enumerate(edits, 1):
+        old, new = e.get("old", ""), e.get("new", "")
+        if not old:
+            return None, f"Edit {i} has an empty `old` string"
+        n = script.count(old)
+        if n != 1:
+            return None, f"Edit {i}: `old` text found {n} times (must be exactly 1)"
+        script = script.replace(old, new, 1)
+    return script, None
 
 
 def validate_fix(code: str) -> str | None:
@@ -107,30 +161,27 @@ def validate_fix(code: str) -> str | None:
     if "def classify_jd(" not in code:
         return "classify_jd() missing — fix looks too aggressive"
 
+    if "async def score_jobs_parallel(" not in code:
+        return "score_jobs_parallel() missing — fix looks too aggressive"
+
     return None
 
 
 def send_email(subject: str, body: str):
-    if not SENDGRID_API_KEY or not NOTIFY_EMAIL:
-        print(f"  Email skipped (no credentials): {subject}")
+    if not SMTP_USER or not SMTP_PASS or not NOTIFY_EMAIL:
+        print(f"  Email skipped (SMTP credentials not set): {subject}")
         return
-    payload = json.dumps({
-        "personalizations": [{"to": [{"email": NOTIFY_EMAIL}]}],
-        "from": {"email": FROM_EMAIL, "name": "Job Monitor"},
-        "subject": subject,
-        "content": [{"type": "text/plain", "value": body}],
-    }).encode()
-    req = Request(
-        "https://api.sendgrid.com/v3/mail/send",
-        data=payload,
-        headers={"Authorization": f"Bearer {SENDGRID_API_KEY}",
-                 "Content-Type": "application/json"},
-        method="POST",
-    )
-    ctx = ssl.create_default_context()
+    import smtplib
+    from email.mime.text import MIMEText
     try:
-        with urlopen(req, timeout=30, context=ctx) as r:
-            print(f"  Email sent ({r.status}): {subject}")
+        msg = MIMEText(body, "plain")
+        msg["Subject"] = subject
+        msg["From"]    = f"Job Monitor <{SMTP_USER}>"
+        msg["To"]      = NOTIFY_EMAIL
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
+            s.login(SMTP_USER, SMTP_PASS)
+            s.sendmail(SMTP_USER, NOTIFY_EMAIL, msg.as_string())
+        print(f"  Email sent: {subject}")
     except Exception as e:
         print(f"  Email failed: {e}")
 
@@ -157,7 +208,13 @@ def main():
         sys.exit(1)
 
     print("Calling Claude API to generate fix...")
-    fixed, api_err = call_claude(error_log, script)
+    result, api_err = call_claude(error_log, script)
+
+    fixed = None
+    if result is not None:
+        fixed, edit_err = apply_edits(script, result.get("edits", []))
+        if fixed is None:
+            api_err = f"Could not apply Claude's edits: {edit_err}"
 
     if fixed is None:
         msg = f"Auto-fix could not generate a patch: {api_err}"
@@ -184,10 +241,13 @@ def main():
     # Write the fix
     with open(SCRIPT_FILE, "w") as f:
         f.write(fixed)
+    with open(SUMMARY_FILE, "w") as f:
+        f.write(f"{result.get('summary', '').strip()}\n\n"
+                f"_{len(result.get('edits', []))} edit(s) applied to `job_monitor.py`._\n")
 
     print(f"  Fix written to {SCRIPT_FILE}")
     set_output("fix_applied", "true")
-    # Success email is sent by the workflow after a successful commit+push
+    # Success email is sent by the workflow after the PR is opened
 
 
 if __name__ == "__main__":

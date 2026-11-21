@@ -1,0 +1,12 @@
+# Private / local-only
+NOTES.md
+job_monitor_agent/job_monitor_run.sh
+job_monitor_agent/resume.pdf
+
+# Runtime artifacts
+job_monitor_agent/job_monitor_state.json
+job_monitor_agent/error_log.txt
+job_monitor_agent/fix_summary.md
+job_monitor_agent/.venv/
+__pycache__/
+.DS_Store

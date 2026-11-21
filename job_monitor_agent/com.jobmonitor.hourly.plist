@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Hourly change-detection — only sends email when page content changes -->
+    <!-- This catches new postings (like Accenture) within ~1 hour of them going live -->
+    <key>Label</key>
+    <string>com.jobmonitor.hourly</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <!-- launchd does not expand $HOME, so let bash do it (keeps the username out of git) -->
+        <string>/bin/bash</string>
+        <string>-c</string>
+        <string>exec "$HOME/Documents/Claude Code/job_monitor_agent_repo/job_monitor_agent/job_monitor_run.sh" --hourly</string>
+    </array>
+
+    <!-- Every hour on the hour -->
+    <key>StartInterval</key>
+    <integer>3600</integer>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/job_monitor_hourly.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/job_monitor_hourly_err.log</string>
+
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>
