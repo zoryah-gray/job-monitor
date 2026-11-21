@@ -41,7 +41,7 @@ best-scored jobs. Token usage per run is printed in the log and kept in `ai_usag
 
 ## Job boards
 
-12 searches across LinkedIn, Indeed, Dice, Wellfound, and BuiltIn targeting
+14 searches across LinkedIn, Indeed, Dice, Wellfound, BuiltIn, and Y Combinator targeting
 entry-level / new-grad SWE roles posted within the last 24 hours.
 
 ---

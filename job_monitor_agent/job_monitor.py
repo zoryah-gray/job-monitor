@@ -104,6 +104,9 @@ COMPANY_INDUSTRIES: dict[str, tuple[str, bool]] = {
     "United Airlines":              ("Aviation / Transportation",           True),
     "UPS":                          ("Logistics / Supply Chain",            True),
     "Zoom":                         ("Tech / Communications",               False),
+    # Job boards: keys must equal the board's "name" in JOB_BOARDS (jobs carry it as their source)
+    "YC Work at a Startup — All roles": ("Startups / Venture-Backed",       False),
+    "YC Jobs — All roles":              ("Startups / Venture-Backed",       False),
 }
 
 # Non-tech industry blurbs shown in the 12pm digest insights panel.
@@ -169,7 +172,7 @@ COMPANIES = [
      "url":  "https://www.bechtel.com/careers/jobs/?q=software+engineer"},
     {"name": "Brunswick",
      "url":  "https://careers.brunswick.com/us/en/search-results?keywords=software+engineer",
-     "timeout_ms": 45000},
+     "timeout_ms": 90000},
     {"name": "Capital One",
      "url":  "https://www.capitalonecareers.com/search-jobs?keywords=software+engineer&country=United%20States"},
     {"name": "Caterpillar (CAT)",
@@ -251,6 +254,12 @@ JOB_BOARDS = [
      "group": "startups"},
     {"name": "BuiltIn — Entry Level SWE",
      "url":  "https://builtin.com/jobs/dev-engineering?search=software+engineer&level=Entry+Level",
+     "group": "startups"},
+    {"name": "YC Work at a Startup — All roles",
+     "url":  "https://www.workatastartup.com/companies?demographic=any&hasEquity=any&hasSalary=any&industry=any&interviewProcess=any&layout=list-compact&sortBy=created_desc&tab=any&usVisaNotRequired=any",
+     "group": "startups"},
+    {"name": "YC Jobs — All roles",
+     "url":  "https://www.ycombinator.com/jobs",
      "group": "startups"},
 ]
 
